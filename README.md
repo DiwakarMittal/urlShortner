@@ -69,3 +69,12 @@ docker-compose.yaml       local Postgres
     "connected" even when it wasn't.
   - Always check that a check can fail: stop the DB and confirm the program
     errors.
+
+### Step 5: the Postgres store (internal/store/postgres.go)
+- Tested with a table-driven test (a slice of `{input, want}` structs
+  looped over). Hand-verified cases: 0→"0", 1→"1", 61→"Z", 62→"10", 125→"21".
+- Go caches passing tests; use `go test -count=1` to force a rerun.
+- Lesson: `string(int)` gives a Unicode character, not digits. Index into an
+  alphabet instead.
+
+### Step 6: the Postgres store (internal/store/postgres.go)
