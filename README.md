@@ -77,4 +77,39 @@ docker-compose.yaml       local Postgres
 - Lesson: `string(int)` gives a Unicode character, not digits. Index into an
   alphabet instead.
 
-### Step 6: the Postgres store (internal/store/postgres.go)
+### Step 6: Postgres store (`internal/store/postgres.go`)
+- `PostgresStore` holds the pool and implements `Store`. Go interfaces are
+  satisfied implicitly; `var _ Store = (*PostgresStore)(nil)` is a
+  compile-time check that it still does.
+- `New...` functions are Go's convention for constructors.
+- Queries use placeholders (`$1`) so values never get interpreted as SQL
+  (prevents SQL injection).
+- `QueryRow(...).Scan(&field)` reads one row into pointers; `Exec` runs
+  statements with no result rows, and `RowsAffected()` tells how many matched.
+- `pgx.ErrNoRows` is translated to our `ErrNotFound` so handlers don't
+  depend on the driver.
+- `Create` needs two statements (the code is derived from the generated ID),
+  so it runs in a transaction (`pgx.BeginFunc`): both succeed or both roll
+  back.
+- Click counting is `clicks = clicks + 1` in SQL, which is atomic; doing
+  read-modify-write in Go would lose counts under concurrency.
+- Errors are wrapped with `fmt.Errorf("...: %w", err)` to add context while
+  keeping `errors.Is` working.
+
+  ### Step 7: Manual test of the store (`cmd/server/main.go`)
+- Before building HTTP, exercised the store directly: Create, Get,
+  IncrementClicks, then Get for a missing code.
+- Holding the store in a `store.Store` variable (the interface type) keeps
+  the calling code independent of Postgres.
+- `errors.Is(err, store.ErrNotFound)` works because handlers/tests compare
+  against our own sentinel error.
+- First row gets ID 1 -> code "1"; codes grow as IDs grow (base62 end to end).
+- This test code is temporary and will be replaced by the real server.
+
+### Step 8: Input validation (planned, `internal/handler/validate.go`)
+- Bad input is a **400 Bad Request**; a missing code on lookup is a **404**.
+  Different failures, different errors.
+- Allowlist, don't blocklist: accept only `http`/`https` URLs with a host.
+  `javascript:` and `data:` URLs are code, not pages.
+- Also cap length (2048) so the database can't be bloated.
+- Validation is a separate function so it can be table-tested like `Encode`.
