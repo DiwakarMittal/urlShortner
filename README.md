@@ -106,10 +106,21 @@ docker-compose.yaml       local Postgres
 - First row gets ID 1 -> code "1"; codes grow as IDs grow (base62 end to end).
 - This test code is temporary and will be replaced by the real server.
 
-### Step 8: Input validation (planned, `internal/handler/validate.go`)
-- Bad input is a **400 Bad Request**; a missing code on lookup is a **404**.
-  Different failures, different errors.
-- Allowlist, don't blocklist: accept only `http`/`https` URLs with a host.
+### Step 8: Input validation (`internal/handler/validate.go`)
+- Bad input is a **400 Bad Request** (`ErrInvalidURL`); a missing code on
+  lookup is a **404** (`store.ErrNotFound`). Different failures, different
+  errors.
+- Allowlist, don't blocklist: only `http`/`https` with a non-empty host.
   `javascript:` and `data:` URLs are code, not pages.
-- Also cap length (2048) so the database can't be bloated.
-- Validation is a separate function so it can be table-tested like `Encode`.
+- Rules: trim and reject empty, length cap (2048), `url.Parse`, scheme
+  check, host check (`Hostname()` so `http://:8080` is caught).
+- `url.Parse` lowercases the scheme, so no manual case handling is needed.
+- `ValidateURL` returns the trimmed string; store that, not the raw input.
+- Errors are wrapped with `%w` so `errors.Is(err, ErrInvalidURL)` works
+  while the message still says why.
+- Validation checks shape only; it does not check that the site exists or
+  is safe.
+- `url.Parse` splits a URL into Scheme, Host, Path, RawQuery, Fragment.
+  It is lenient: `example.com`, `javascript:alert(1)`, and `http://` all
+  parse without error. A nil error only means "recognizable structure",
+  so we check scheme and hostname ourselves afterwards.
