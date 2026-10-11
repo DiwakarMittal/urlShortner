@@ -2,13 +2,23 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
+	"net/http"
 	"os"
+	"time"
+	"urlshortener/internal/handler"
 	"urlshortener/internal/store"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// getenv returns the environment variable, or fallback when it's empty.
+func getenv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // 1. Create a context
 // 2. Read DATABASE_URL from the environment.
@@ -24,11 +34,10 @@ func main() {
 	// A context carries deadlines/cancellation; Background is the empty root.
 	ctx := context.Background()
 
-	// Read config from the environment; fall back to the local Docker DB.
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://shortener:shortener@localhost:5433/shortener"
-	}
+	// Configuration comes from the environment, with local defaults.
+	dbURL := getenv("DATABASE_URL", "postgres://shortener:shortener@localhost:5433/shortener")
+	baseURL := getenv("BASE_URL", "http://localhost:8080") // used to build short links
+	addr := getenv("ADDR", ":8080")                        // where the server listens
 
 	// One shared connection pool for the whole app.
 	pool, err := pgxpool.New(ctx, dbURL)
@@ -47,37 +56,19 @@ func main() {
 	// the same way the handler will see it later
 
 	var s store.Store = store.NewPostgresStore(pool)
+	h := handler.NewHandler(s, baseURL)
 
-	// 1. create a link and print the same
-	link, err := s.Create(ctx, "https://example.com/some/long/path")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("created: %+v", link)
+	// Routes: Go 1.22+ patterns include the method and path wildcards.
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /shorten", h.Shorten)
+	mux.HandleFunc("GET /{code}", h.Redirect)
 
-	// 2. Look it up by its code.
-	got, err := s.Get(ctx, link.Code)
-	if err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
-	log.Printf("fetched: %+v", got)
 
-	// 3. Count one click, then fetch again; Clicks should now be 1 higher.
-	if err = s.IncrementClicks(ctx, link.Code); err != nil {
-		log.Fatal(err)
-	}
-	got, err = s.Get(ctx, link.Code)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("after click: clicks=%d", got.Clicks)
-
-	// 4. A code that doesn't exist must give ErrNotFound.
-	// errors.Is checks the error even if it was wrapped.
-	_, err = s.Get(ctx, "nope")
-	if errors.Is(err, store.ErrNotFound) {
-		log.Println("missing code correctly returned ErrNotFound")
-	} else {
-		log.Fatalf("expected ErrNotFound, got: %v", err)
-	}
+	log.Printf("listening on %s", addr)
+	log.Fatal(srv.ListenAndServe())
 }

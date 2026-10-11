@@ -32,6 +32,13 @@ internal/shortcode/       base62 encoding
 migrations/               SQL schema
 docker-compose.yaml       local Postgres
 ```
+### Inspecting the database with a GUI (TablePlus)
+- Connection: PostgreSQL, host `127.0.0.1`, port **5433** (the host side
+  of the Docker port mapping), user/password/database `shortener`.
+- Browse rows under `public` -> `links` (Data tab) and the schema in the
+  Structure tab. Refresh (Cmd+R) to see new clicks; it doesn't live-update.
+- Manual edits and `UPDATE`/`DELETE` here affect real data; always use a
+  `WHERE`.
 
 `internal/` is enforced by Go: other modules cannot import these packages.
 
@@ -124,3 +131,39 @@ docker-compose.yaml       local Postgres
   It is lenient: `example.com`, `javascript:alert(1)`, and `http://` all
   parse without error. A nil error only means "recognizable structure",
   so we check scheme and hostname ourselves afterwards.
+
+### Step 9: HTTP handlers (`internal/handler/handler.go`, `cmd/server/main.go`)
+- `Handler` struct holds the `Store` interface and base URL; handlers are
+  methods on it (same pattern as `PostgresStore`).
+- Routing with Go 1.22+ `ServeMux`: `POST /shorten`, `GET /{code}`;
+  `r.PathValue("code")` reads the wildcard.
+- `Shorten`: cap body (`MaxBytesReader`), decode JSON, validate (400),
+  store the cleaned URL, respond 201. Errors from our own failures are
+  logged and answered with a generic 500 so internals don't leak.
+- `Redirect`: lookup (404 on `ErrNotFound`), count the click, 302 redirect.
+  - **302 vs 301**: browsers cache 301, so repeat visits would skip our
+    server and never be counted. 302 always comes back.
+  - A failed click count is logged but doesn't block the redirect.
+- `writeJSON`: set headers before `WriteHeader`; later header changes are
+  ignored.
+- `main.go` only wires layers (pool -> store -> handler) and reads config
+  from env (`DATABASE_URL`, `BASE_URL`, `ADDR`). It uses an explicit
+  `http.Server` with `ReadHeaderTimeout` to resist slow-client attacks.
+- `log.Fatal` skips deferred calls; graceful shutdown is a later upgrade.
+- Manual test with `curl -i`: 201 / 302 / 400 / 404 all verified.
+- Verified with curl: valid shorten -> 201 + short URL; redirect -> 302 with
+  `Location`; `javascript:` URL -> 400; invalid JSON -> 400; unknown code ->
+  404. `lsof -i :8080` shows what is listening on a port; a "connection
+  refused" from curl means no server is running there.
+- `http.Redirect` also writes a small HTML body for clients that don't
+  follow redirects.
+
+### Step 10: Handler tests with a fake store (planned)
+- `Handler` depends on the `Store` interface, so tests use an in-memory
+  `fakeStore`: no database or Docker needed, and failures can be injected
+  (`err` field) to test the 500 path.
+- `httptest.NewRequest` + `httptest.NewRecorder` call handlers as plain
+  functions: no server or port.
+- Routes live in `Handler.Routes()` so tests and `main` share them;
+  `r.PathValue` only works when the request goes through the mux.
+- Maps hold copies of structs: read, modify, write back.
