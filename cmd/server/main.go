@@ -6,10 +6,11 @@ import (
 	"net/http"
 	"os"
 	"time"
-	"urlshortener/internal/handler"
-	"urlshortener/internal/store"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"urlshortener/internal/handler"
+	"urlshortener/internal/store"
 )
 
 // getenv returns the environment variable, or fallback when it's empty.
@@ -20,18 +21,7 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
-// 1. Create a context
-// 2. Read DATABASE_URL from the environment.
-//    If it's empty, use the default connection string.
-// 3. Create the pool with pgxpool.New(...)
-//    If err != nil, log.Fatal(err)
-// 4. defer pool.Close()
-// 5. Ping the pool.
-//    If err != nil, log.Fatal(err)
-// 6. Print "connected to postgres"
-
 func main() {
-	// A context carries deadlines/cancellation; Background is the empty root.
 	ctx := context.Background()
 
 	// Configuration comes from the environment, with local defaults.
@@ -44,7 +34,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer pool.Close() // release connections on exit
+	defer pool.Close()
 
 	// New() may not connect immediately; Ping proves the DB is reachable.
 	if err = pool.Ping(ctx); err != nil {
@@ -52,20 +42,16 @@ func main() {
 	}
 	log.Println("connected to Postgres")
 
-	// Build the store. We keep the variable typed as the store interface.
-	// the same way the handler will see it later
-
+	// Wire the layers: pool -> store -> handler. The handler only sees
+	// the store.Store interface.
 	var s store.Store = store.NewPostgresStore(pool)
 	h := handler.NewHandler(s, baseURL)
 
-	// Routes: Go 1.22+ patterns include the method and path wildcards.
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /shorten", h.Shorten)
-	mux.HandleFunc("GET /{code}", h.Redirect)
-
+	// Explicit Server so we can set timeouts; without them, slow clients
+	// can hold connections open forever.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           h.Routes(), // routes now live in the handler package
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

@@ -158,12 +158,23 @@ docker-compose.yaml       local Postgres
 - `http.Redirect` also writes a small HTML body for clients that don't
   follow redirects.
 
-### Step 10: Handler tests with a fake store (planned)
+### Step 10: Handler tests with a fake store (`internal/handler/handler_test.go`)
 - `Handler` depends on the `Store` interface, so tests use an in-memory
-  `fakeStore`: no database or Docker needed, and failures can be injected
-  (`err` field) to test the 500 path.
-- `httptest.NewRequest` + `httptest.NewRecorder` call handlers as plain
-  functions: no server or port.
-- Routes live in `Handler.Routes()` so tests and `main` share them;
-  `r.PathValue` only works when the request goes through the mux.
-- Maps hold copies of structs: read, modify, write back.
+  `fakeStore`: no database or Docker, runs in milliseconds.
+- The fake has an `err` field to simulate a database outage, which is hard
+  to trigger with real Postgres. It returns the same `store.ErrNotFound`
+  sentinel as the real store so the handler's `errors.Is` check works.
+- Maps hold copies of structs: read, modify, write back
+  (`f.links[code].Clicks++` does not compile).
+- `httptest.NewRequest` + `httptest.NewRecorder` call the handler as a plain
+  function: no server, no port. Requests go through `Handler.Routes()` so
+  the real routing (including `r.PathValue`) is tested; calling
+  `h.Redirect` directly would leave `PathValue` empty.
+- Each test builds a fresh fake so tests never share state.
+- Cases: shorten OK, stores the trimmed URL, bad input (400, nothing
+  stored), redirect OK (302 + `Location` + click counted), every visit
+  counted, unknown code (404), store failure (500 that doesn't leak the
+  internal error).
+- `t.Fatalf` stops a test when later checks are meaningless; `t.Errorf`
+  records and continues.
+- Verified the tests can fail by breaking the handler on purpose.
