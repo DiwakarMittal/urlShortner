@@ -69,7 +69,7 @@ func run() error {
 	// can hold connections open forever.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           h.Routes(), // routes now live in the handler package
+		Handler:           handler.LogRequests(h.Routes()), // routes now live in the handler package
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

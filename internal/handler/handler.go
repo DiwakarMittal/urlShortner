@@ -24,9 +24,6 @@ func NewHandler(s store.Store, baseURL string) *Handler {
 }
 
 // Request and response bodies. The `json:"..."` tags set the JSON key names.
-type shortenRequest struct {
-	URL string `json:"url"`
-}
 
 type shortenResponse struct {
 	ShortURL string `json:"short_url"`
@@ -34,6 +31,11 @@ type shortenResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+type shortenRequest struct {
+	URL   string `json:"url"`
+	Alias string `json:"alias"` // optional; empty means "generate a code for me"
 }
 
 // writeJSON sends v as JSON with the given status code.
@@ -52,26 +54,41 @@ func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 	// Cap the body at 1 MB so a client can't make us read unlimited data.
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
-	// Decode {"url": "..."} into a struct. Bad JSON is the client's fault: 400.
 	var req shortenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "body must be JSON like {\"url\": \"https://...\"}"})
 		return
 	}
 
-	// Validate. Every error ValidateURL returns wraps ErrInvalidURL,
-	// so it's always bad input (400), and the message says why.
 	cleaned, err := ValidateURL(req.URL)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
 		return
 	}
 
-	// Store the CLEANED url (trimmed), not the raw input.
-	link, err := h.store.Create(r.Context(), cleaned)
+	// Validate the alias (if any) BEFORE touching the store, same as the URL.
+	if req.Alias != "" {
+		if err := ValidateAlias(req.Alias); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: err.Error()})
+			return
+		}
+	}
+
+	// Two paths to a Link: generated code, or caller-chosen code.
+	var link store.Link
+	if req.Alias == "" {
+		link, err = h.store.Create(r.Context(), cleaned)
+	} else {
+		link, err = h.store.CreateWithCode(r.Context(), cleaned, req.Alias)
+	}
+
+	// A taken alias is the client's conflict, not our failure: 409.
+	if errors.Is(err, store.ErrAliasTaken) {
+		writeJSON(w, http.StatusConflict, errorResponse{Error: "alias already taken"})
+		return
+	}
 	if err != nil {
-		// Log the details for us; send the client a generic message so
-		// internals (like SQL errors) never leak.
+		// Log the details for us; send the client a generic message.
 		log.Printf("create link: %v", err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal error"})
 		return

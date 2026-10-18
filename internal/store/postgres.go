@@ -7,6 +7,7 @@ import (
 	"urlshortener/internal/shortcode"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -100,4 +101,32 @@ func (s *PostgresStore) IncrementClicks(ctx context.Context, code string) error 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// CreateWithCode inserts a link under a caller-chosen code. It is ONE
+// statement, so no transaction is needed (unlike Create, which needs the
+// generated ID before it can compute the code).
+//
+// Uniqueness is enforced by the UNIQUE constraint on code, not by a SELECT
+// first: check-then-insert is a race, because two requests could both see
+// "not taken" and both insert. The database is the single source of truth;
+// we just translate its error.
+func (s *PostgresStore) CreateWithCode(ctx context.Context, longURL, code string) (Link, error) {
+	link := Link{LongURL: longURL, Code: code}
+
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO links (long_url, code) VALUES ($1, $2) RETURNING id, created_at`,
+		longURL, code,
+	).Scan(&link.ID, &link.CreatedAt)
+	if err != nil {
+		// errors.As looks through the wrapping chain for a *pgconn.PgError.
+		// 23505 is Postgres' "unique_violation"; checking the constraint
+		// name makes sure it's the code column and nothing else.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "links_code_key" {
+			return Link{}, ErrAliasTaken
+		}
+		return Link{}, fmt.Errorf("insert link with code: %w", err)
+	}
+	return link, nil
 }

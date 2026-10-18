@@ -12,7 +12,15 @@ redirects visitors to the original page.
 The short link is only a pointer. The original page is unchanged, and the
 shortener server must be publicly reachable for others to use the links.
 
+## API
+
+| Request | Success | Errors |
+|---|---|---|
+| `POST /shorten` with `{"url": "...", "alias": "optional-name"}` | `201` `{"short_url": "..."}` | `400` bad JSON / URL / alias, `409` alias taken, `500` |
+| `GET /{code}` | `302` redirect to the long URL (click counted) | `404` unknown code, `500` |
+
 ## Quick start
+
 ```
 docker compose up -d
 docker compose exec -T db psql -U shortener -d shortener < migrations/001_create_links.sql
@@ -26,7 +34,19 @@ curl -i -X POST localhost:8080/shorten -d '{"url":"https://example.com"}'
 curl -i localhost:8080/<code>
 ```
 
+Custom alias (3 to 32 characters, must contain a `-` or `_`):
+
+```
+curl -i -X POST localhost:8080/shorten -d '{"url":"https://example.com","alias":"my-link"}'
+```
+
 Run all tests: `go test -count=1 ./...`
+
+Integration tests (real Postgres; see Step 14 for the one-time setup):
+
+```
+TEST_DATABASE_URL="postgres://shortener:shortener@localhost:5433/shortener_test" go test -count=1 -v ./internal/store/
+```
 
 | Env var | Default |
 |---|---|
@@ -47,17 +67,23 @@ Run all tests: `go test -count=1 ./...`
 ## Project structure
 
 ```
-cmd/server/main.go              entry point: config, DB, graceful shutdown
-internal/store/store.go         Link struct, Store interface, ErrNotFound
-internal/store/postgres.go      Postgres implementation
-internal/handler/handler.go     HTTP handlers and routes
-internal/handler/validate.go    URL validation
-internal/handler/*_test.go      handler + validation tests (fake store)
-internal/shortcode/base62.go    base62 encoding (+ test)
-migrations/001_create_links.sql schema
-docker-compose.yaml             local Postgres
+cmd/server/main.go                 entry point: config, DB, graceful shutdown
+internal/store/store.go            Link struct, Store interface, errors
+internal/store/postgres.go         Postgres implementation
+internal/store/postgres_test.go    integration tests (need TEST_DATABASE_URL)
+internal/handler/handler.go        HTTP handlers and routes
+internal/handler/validate.go       URL and alias validation
+internal/handler/middleware.go     access log middleware
+internal/handler/*_test.go         handler, validation, middleware tests
+internal/shortcode/base62.go       base62 encoding (+ test)
+migrations/001_create_links.sql    schema
+docker-compose.yaml                local Postgres
 ```
-### Inspecting the database with a GUI (TablePlus)
+
+`internal/` is enforced by Go: other modules cannot import these packages.
+
+## Inspecting the database (TablePlus)
+
 - Connection: PostgreSQL, host `127.0.0.1`, port **5433** (the host side
   of the Docker port mapping), user/password/database `shortener`.
 - Browse rows under `public` -> `links` (Data tab) and the schema in the
@@ -65,7 +91,14 @@ docker-compose.yaml             local Postgres
 - Manual edits and `UPDATE`/`DELETE` here affect real data; always use a
   `WHERE`.
 
-`internal/` is enforced by Go: other modules cannot import these packages.
+## Known limitations
+
+- Generated codes are sequential, so links can be enumerated.
+- Aliases are case-sensitive (`My-Link` and `my-link` differ).
+- No rate limiting, authentication, link expiry, or per-click analytics.
+- Validation checks URL shape only, not whether the site exists or is safe.
+- Click counting is synchronous (one extra DB write per redirect).
+- Runs locally; not yet deployed or containerized.
 
 ## Step log
 
@@ -73,7 +106,8 @@ docker-compose.yaml             local Postgres
 - `Link` mirrors one row of the `links` table.
 - Store only the **code** (`aB3xYz`), not the full short URL. The domain is
   configuration, not data.
-- `Store` has three methods: `Create`, `Get`, `IncrementClicks`.
+- `Store` started with three methods: `Create`, `Get`, `IncrementClicks`
+  (a fourth, `CreateWithCode`, arrives in Step 13).
 - `ErrNotFound` is a sentinel error so handlers can return 404 using
   `errors.Is`.
 - Go convention: `context.Context` is the first parameter of anything that
@@ -138,7 +172,7 @@ docker-compose.yaml             local Postgres
 - Errors are wrapped with `fmt.Errorf("...: %w", err)` to add context while
   keeping `errors.Is` working.
 
-  ### Step 7: Manual test of the store (`cmd/server/main.go`)
+### Step 7: Manual test of the store (`cmd/server/main.go`)
 - Before building HTTP, exercised the store directly: Create, Get,
   IncrementClicks, then Get for a missing code.
 - Holding the store in a `store.Store` variable (the interface type) keeps
@@ -146,7 +180,7 @@ docker-compose.yaml             local Postgres
 - `errors.Is(err, store.ErrNotFound)` works because handlers/tests compare
   against our own sentinel error.
 - First row gets ID 1 -> code "1"; codes grow as IDs grow (base62 end to end).
-- This test code is temporary and will be replaced by the real server.
+- This test code was temporary and was replaced by the real server.
 
 ### Step 8: Input validation (`internal/handler/validate.go`)
 - Bad input is a **400 Bad Request** (`ErrInvalidURL`); a missing code on
@@ -189,18 +223,17 @@ docker-compose.yaml             local Postgres
 - `main.go` only wires layers (pool -> store -> handler) and reads config
   from env (`DATABASE_URL`, `BASE_URL`, `ADDR`). It uses an explicit
   `http.Server` with `ReadHeaderTimeout` to resist slow-client attacks.
-- `log.Fatal` skips deferred calls; graceful shutdown is a later upgrade.
-- Manual test with `curl -i`: 201 / 302 / 400 / 404 all verified.
+- `log.Fatal` skips deferred calls (fixed in Step 11).
 - Verified with curl: valid shorten -> 201 + short URL; redirect -> 302 with
   `Location`; `javascript:` URL -> 400; invalid JSON -> 400; unknown code ->
   404. `lsof -i :8080` shows what is listening on a port; a "connection
   refused" from curl means no server is running there.
 - `http.Redirect` also writes a small HTML body for clients that don't
   follow redirects.
-- `log.Fatal` skips deferred calls (fixed in Step 11).
 - Logs: Go's `log` package writes to **stderr** of the process, i.e. the
   terminal running the server. Clients never see them: the client gets a
-  generic error, the real reason is in the server log. No access log yet.
+  generic error, the real reason is in the server log. (An access log was
+  added in Step 12.)
 
 ### Step 10: Handler tests with a fake store (`internal/handler/handler_test.go`)
 - `Handler` depends on the `Store` interface, so tests use an in-memory
@@ -255,3 +288,74 @@ docker-compose.yaml             local Postgres
   `kill <PID>` stops it. The Docker container doesn't restart by itself
   after Docker restarts or the Mac sleeps; `docker compose up -d` brings
   it back, and `restart: unless-stopped` in the compose file avoids it.
+
+### Step 12: Access log middleware (`internal/handler/middleware.go`)
+- Middleware = `func(http.Handler) http.Handler`: wraps a handler to run
+  code before and after it.
+- `http.ResponseWriter` can't report the status afterwards, so
+  `statusRecorder` embeds it and overrides `WriteHeader` to remember the
+  code and forward the call (skipping the forward would break responses).
+- Default status is 200 because Go sends 200 when a handler never calls
+  `WriteHeader`. In this app every path calls it explicitly, so the
+  default only matters for body-only handlers (covered by a test).
+- Pass the recorder, not the original writer, to `next.ServeHTTP`.
+- Wrapping the whole router in `main.go` also logs 404s from unmatched
+  routes.
+- Log method, path, status, duration. Use `r.URL.Path`, not the full URL:
+  query strings and bodies can contain secrets.
+- Tests: the recorder saves and forwards; the middleware logs the right
+  status, defaults to 200, and omits the query string. Log output is
+  captured by swapping `log.SetOutput` (global state, so no `t.Parallel`);
+  `t.Cleanup` restores it. A cleaner design injects a logger.
+- Verified live: one log line per request (201 / 302 / 404 / 400),
+  matching the status `curl -i` shows. The log appears in the server's
+  terminal, not the client's. `go test -count=1 ./...` passes.
+
+### Step 13: Custom aliases
+- Optional `alias` in `POST /shorten`; invalid -> 400, taken -> 409.
+- Alias rules (`ValidateAlias`): 3-32 chars, only `A-Z a-z 0-9 - _`, at
+  least one `-` or `_`, not a reserved word (case-insensitive). The
+  `-`/`_` rule guarantees an alias can never equal a generated base62
+  code (base62 has neither character), so a normal `Create` can't collide
+  with an alias later.
+- Interface: separate `CreateWithCode` method, so `Create` and its tests
+  are untouched. A single INSERT, so no transaction is needed.
+- Race-free uniqueness: rely on the `UNIQUE` constraint and translate
+  Postgres error `23505` (`*pgconn.PgError`, constraint `links_code_key`)
+  into `ErrAliasTaken` with `errors.As`, instead of check-then-insert
+  (two requests could both pass the check).
+- A taken alias is the client's conflict (409), not a server failure (500).
+- Handler tests use the fake store, which returns `ErrAliasTaken` by
+  construction: they prove the 409 mapping, not the Postgres translation
+  (that needs a real-database test, Step 14).
+- Verified against real Postgres with curl: alias create -> 201, redirect
+  -> 302, duplicate alias -> 409 (proves the `23505` translation, which
+  the fake-store tests can't), alias without `-`/`_` -> 400.
+- Debugging lesson: a stale server (not restarted after code changes)
+  silently ignored the new `alias` field, because `encoding/json` drops
+  unknown fields. `DisallowUnknownFields()` turns that into a 400.
+- Caveats: failed inserts consume a `BIGSERIAL` value (gaps in IDs are
+  harmless); aliases are case-sensitive (`My-Link` != `my-link`).
+
+### Step 14: Integration tests for `PostgresStore` (`internal/store/postgres_test.go`)
+- Unit tests (fake store) prove handler logic; integration tests against
+  real Postgres prove the SQL, the transaction, and the error translations
+  (`pgx.ErrNoRows` -> `ErrNotFound`, `RowsAffected == 0` -> `ErrNotFound`,
+  `23505` -> `ErrAliasTaken`). You need both.
+- Tests are skipped unless `TEST_DATABASE_URL` is set, so `go test ./...`
+  works without Docker. A package where every test skips still prints
+  `ok`: that only proves the skip logic, not the SQL.
+- One-time setup:
+  ```
+  docker compose exec db psql -U shortener -d shortener -c "CREATE DATABASE shortener_test"
+  docker compose exec -T db psql -U shortener -d shortener_test < migrations/001_create_links.sql
+  ```
+- Each test starts with `TRUNCATE links RESTART IDENTITY` so IDs begin at
+  1. The helper refuses to run unless `current_database()` ends in
+  `_test`, so a wrong URL can't wipe real data.
+- No `t.Parallel()`: tests share one table.
+- Concurrency test: 50 goroutines x 10 increments must give exactly 500
+  (passed). `clicks = clicks + 1` in SQL is atomic.
+- `t.Fatalf` only from the test's own goroutine; use `t.Errorf` in
+  goroutines. Compare `time.Time` with `Equal`, not `==`.
+- Result: all 9 integration tests pass against the real database.

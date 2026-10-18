@@ -216,6 +216,7 @@ func TestStoreFailure_Returns500WithoutLeaking(t *testing.T) {
 	}{
 		{"shorten", "POST", "/shorten", `{"url":"https://example.com"}`},
 		{"redirect", "GET", "/abc", ""},
+		{"shorten with alias", "POST", "/shorten", `{"url":"https://example.com","alias":"my-link"}`},
 	}
 
 	for _, tt := range tests {
@@ -233,5 +234,95 @@ func TestStoreFailure_Returns500WithoutLeaking(t *testing.T) {
 				t.Errorf("response leaked the internal error: %s", rec.Body.String())
 			}
 		})
+	}
+}
+
+func (f *fakeStore) CreateWithCode(ctx context.Context, longURL, code string) (store.Link, error) {
+	if f.err != nil {
+		return store.Link{}, f.err
+	}
+	// Same sentinel as the real store, so the handler's errors.Is works.
+	if _, exists := f.links[code]; exists {
+		return store.Link{}, store.ErrAliasTaken
+	}
+	l := store.Link{ID: int64(len(f.links) + 1), Code: code, LongURL: longURL}
+	f.links[code] = l
+	return l, nil
+}
+
+func TestShorten_AliasOK(t *testing.T) {
+	h, f := newTestHandler()
+
+	rec := do(h, "POST", "/shorten", `{"url":"https://example.com","alias":"my-link"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var resp shortenResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("response is not valid JSON: %v", err)
+	}
+	if want := "http://short.test/my-link"; resp.ShortURL != want {
+		t.Errorf("short_url = %q, want %q", resp.ShortURL, want)
+	}
+	if got := f.links["my-link"].LongURL; got != "https://example.com" {
+		t.Errorf("stored %q, want %q", got, "https://example.com")
+	}
+}
+
+func TestShorten_AliasTaken(t *testing.T) {
+	h, f := newTestHandler()
+	f.links["my-link"] = store.Link{ID: 1, Code: "my-link", LongURL: "https://original.example"}
+
+	rec := do(h, "POST", "/shorten", `{"url":"https://other.example","alias":"my-link"}`)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	// The existing link must NOT be overwritten.
+	if got := f.links["my-link"].LongURL; got != "https://original.example" {
+		t.Errorf("existing link changed to %q", got)
+	}
+}
+
+func TestShorten_InvalidAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"no separator", `{"url":"https://example.com","alias":"summer"}`},
+		{"too short", `{"url":"https://example.com","alias":"a-"}`},
+		{"slash", `{"url":"https://example.com","alias":"my/link"}`},
+		{"reserved", `{"url":"https://example.com","alias":"shorten"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, f := newTestHandler()
+
+			rec := do(h, "POST", "/shorten", tt.body)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+			}
+			if len(f.links) != 0 {
+				t.Errorf("store has %d links, want 0", len(f.links))
+			}
+		})
+	}
+}
+
+// Redirects must work for aliases exactly like generated codes.
+func TestRedirect_Alias(t *testing.T) {
+	h, _ := newTestHandler()
+	do(h, "POST", "/shorten", `{"url":"https://example.com/target","alias":"my-link"}`)
+
+	rec := do(h, "GET", "/my-link", "")
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusFound)
+	}
+	if got := rec.Header().Get("Location"); got != "https://example.com/target" {
+		t.Errorf("Location = %q, want %q", got, "https://example.com/target")
 	}
 }

@@ -10,6 +10,10 @@ import (
 // Handlers check it with errors.Is(err, store.ErrNotFound) to send a 404.
 var ErrNotFound = errors.New("link not found")
 
+// ErrAliasTaken is returned when a requested custom code already exists.
+// Handlers map it to HTTP 409 Conflict.
+var ErrAliasTaken = errors.New("alias already taken")
+
 // Link mirrors one row of the "links" table.
 type Link struct {
 	ID        int64     // database primary key; the short code is derived from it
@@ -24,8 +28,14 @@ type Link struct {
 type Store interface {
 	// Create saves a long URL and returns the new Link (with ID and Code).
 	Create(ctx context.Context, longURL string) (Link, error)
+
+	// CreateWithCode saves a long URL under a caller-chosen code (an alias).
+	// Returns ErrAliasTaken if the code already exists.
+	CreateWithCode(ctx context.Context, longURL, code string) (Link, error)
+
 	// Get finds a link by its short code. Returns ErrNotFound if missing.
 	Get(ctx context.Context, code string) (Link, error)
+
 	// IncrementClicks adds one to the click count for the code.
 	IncrementClicks(ctx context.Context, code string) error
 }

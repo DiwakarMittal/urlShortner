@@ -65,3 +65,42 @@ func TestValidateURLTrims(t *testing.T) {
 		t.Errorf("ValidateURL returned %q, want %q", got, want)
 	}
 }
+
+func TestValidateAlias(t *testing.T) {
+	tests := []struct {
+		name    string
+		alias   string
+		wantErr bool // true = should be rejected
+	}{
+		// Accepted
+		{"valid hyphen", "my-link", false},
+		{"valid underscore and caps", "Summer_Sale", false},
+		{"minimum length", "a-b", false},
+		{"maximum length", strings.Repeat("a-", 16), false}, // 32 chars
+
+		// Rejected
+		{"too short", "ab", true},
+		{"too long", strings.Repeat("a-", 16) + "a", true}, // 33 chars
+		{"no separator", "summer", true},
+		{"space", "my link", true},
+		{"slash", "my/link", true},
+		{"query char", "my-link?x=1", true},
+		{"non-ascii", "héllo-x", true},
+		{"reserved", "shorten", true},
+		{"reserved uppercase", "SHORTEN", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAlias(tt.alias)
+
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Errorf("ValidateAlias(%q) error = %v, wantErr %v", tt.alias, err, tt.wantErr)
+			}
+			// Rejections must wrap our sentinel so the handler can map them to 400.
+			if tt.wantErr && !errors.Is(err, ErrInvalidAlias) {
+				t.Errorf("ValidateAlias(%q) error = %v, want it to wrap ErrInvalidAlias", tt.alias, err)
+			}
+		})
+	}
+}
