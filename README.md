@@ -12,6 +12,28 @@ redirects visitors to the original page.
 The short link is only a pointer. The original page is unchanged, and the
 shortener server must be publicly reachable for others to use the links.
 
+## Quick start
+```
+docker compose up -d
+docker compose exec -T db psql -U shortener -d shortener < migrations/001_create_links.sql
+go run ./cmd/server
+```
+
+Try it:
+
+```
+curl -i -X POST localhost:8080/shorten -d '{"url":"https://example.com"}'
+curl -i localhost:8080/<code>
+```
+
+Run all tests: `go test -count=1 ./...`
+
+| Env var | Default |
+|---|---|
+| `DATABASE_URL` | `postgres://shortener:shortener@localhost:5433/shortener` |
+| `BASE_URL` | `http://localhost:8080` |
+| `ADDR` | `:8080` |
+
 ## Tech choices (and why)
 
 | Choice | Why |
@@ -25,12 +47,15 @@ shortener server must be publicly reachable for others to use the links.
 ## Project structure
 
 ```
-cmd/server/main.go        entry point: config, DB connection, start server
-internal/store/           Link struct, Store interface, Postgres implementation
-internal/handler/         HTTP handlers
-internal/shortcode/       base62 encoding
-migrations/               SQL schema
-docker-compose.yaml       local Postgres
+cmd/server/main.go              entry point: config, DB, graceful shutdown
+internal/store/store.go         Link struct, Store interface, ErrNotFound
+internal/store/postgres.go      Postgres implementation
+internal/handler/handler.go     HTTP handlers and routes
+internal/handler/validate.go    URL validation
+internal/handler/*_test.go      handler + validation tests (fake store)
+internal/shortcode/base62.go    base62 encoding (+ test)
+migrations/001_create_links.sql schema
+docker-compose.yaml             local Postgres
 ```
 ### Inspecting the database with a GUI (TablePlus)
 - Connection: PostgreSQL, host `127.0.0.1`, port **5433** (the host side
@@ -77,12 +102,22 @@ docker-compose.yaml       local Postgres
   - Always check that a check can fail: stop the DB and confirm the program
     errors.
 
-### Step 5: the Postgres store (internal/store/postgres.go)
+### Step 5: Base62 encoding (`internal/shortcode/base62.go`)
+- A base62 code is the row ID written in a number system with 62 symbols
+  (`0-9a-zA-Z`), like decimal but with more symbols.
+- Algorithm: repeatedly take `id % 62` (the next digit, rightmost first)
+  and `id / 62` until the quotient is 0; then reverse the digits.
+- Why encode the ID instead of random strings: IDs are unique, so codes
+  can never collide and no retry logic is needed.
+- Why base62: URL-safe (no `+` or `/`) and compact. 6 chars cover ~56.8
+  billion IDs.
+- Caveats: codes are case-sensitive, and sequential IDs are guessable.
 - Tested with a table-driven test (a slice of `{input, want}` structs
-  looped over). Hand-verified cases: 0→"0", 1→"1", 61→"Z", 62→"10", 125→"21".
+  looped over). Hand-verified cases: 0→"0", 1→"1", 61→"Z", 62→"10",
+  125→"21".
 - Go caches passing tests; use `go test -count=1` to force a rerun.
-- Lesson: `string(int)` gives a Unicode character, not digits. Index into an
-  alphabet instead.
+- Lesson: `string(int)` gives a Unicode character, not digits. Index into
+  an alphabet instead.
 
 ### Step 6: Postgres store (`internal/store/postgres.go`)
 - `PostgresStore` holds the pool and implements `Store`. Go interfaces are
@@ -131,6 +166,11 @@ docker-compose.yaml       local Postgres
   It is lenient: `example.com`, `javascript:alert(1)`, and `http://` all
   parse without error. A nil error only means "recognizable structure",
   so we check scheme and hostname ourselves afterwards.
+- Tests: table-driven with `wantErr` meaning "should be rejected". The
+  check compares `err != nil` to `wantErr`; passing tests stay silent.
+  Rejections must wrap `ErrInvalidURL`. Lesson: a test that only reports
+  errors, without comparing to the expectation, can't tell a correct
+  rejection from a bug.
 
 ### Step 9: HTTP handlers (`internal/handler/handler.go`, `cmd/server/main.go`)
 - `Handler` struct holds the `Store` interface and base URL; handlers are
@@ -157,6 +197,10 @@ docker-compose.yaml       local Postgres
   refused" from curl means no server is running there.
 - `http.Redirect` also writes a small HTML body for clients that don't
   follow redirects.
+- `log.Fatal` skips deferred calls (fixed in Step 11).
+- Logs: Go's `log` package writes to **stderr** of the process, i.e. the
+  terminal running the server. Clients never see them: the client gets a
+  generic error, the real reason is in the server log. No access log yet.
 
 ### Step 10: Handler tests with a fake store (`internal/handler/handler_test.go`)
 - `Handler` depends on the `Store` interface, so tests use an in-memory
@@ -178,3 +222,36 @@ docker-compose.yaml       local Postgres
 - `t.Fatalf` stops a test when later checks are meaningless; `t.Errorf`
   records and continues.
 - Verified the tests can fail by breaking the handler on purpose.
+
+### Step 11: Graceful shutdown (`cmd/server/main.go`)
+- `signal.NotifyContext` turns SIGINT (Ctrl+C) and SIGTERM (sent by
+  Docker / Kubernetes / systemd) into a cancelled context.
+- `srv.Shutdown(ctx)` stops accepting new connections and waits for
+  in-flight requests, up to a deadline (10s here).
+- `ListenAndServe` blocks, so it runs in a goroutine; `select` waits for
+  either a server error or a shutdown signal. The error channel is
+  buffered (size 1) so the goroutine's send can never block forever.
+- The shutdown deadline uses a fresh `context.Background()` because the
+  signal context is already cancelled.
+- After `Shutdown`, `ListenAndServe` returns `http.ErrServerClosed`: the
+  normal, expected result, not a failure.
+- `log.Fatal` calls `os.Exit` and skips defers, so all work moved to
+  `run() error`; `main` just calls `log.Fatal(run())`. `pool.Close()` now
+  runs on every exit path.
+- Calling `stop()` after the first signal restores default behavior, so a
+  second Ctrl+C force-kills the process.
+- Verified in-flight handling: with a 10s sleep in `Redirect`, Ctrl+C
+  about 9s into a request printed "shutting down...", the request still
+  completed with its 302 (response header `Connection: close`, which Go
+  adds during shutdown), and "server stopped cleanly" appeared only after
+  the response was sent.
+- The 10s shutdown deadline is a real limit: requests that need longer are
+  cut off and `Shutdown` returns "context deadline exceeded".
+- Testing lesson: a test must exercise the thing it claims to prove.
+  Ctrl+C on an idle server only proves the idle path; compare timestamps
+  to be sure of the order of events.
+- Gotchas: a server left running from an older build still holds port
+  8080 ("address already in use"); `lsof -i :8080` finds the PID and
+  `kill <PID>` stops it. The Docker container doesn't restart by itself
+  after Docker restarts or the Mac sleeps; `docker compose up -d` brings
+  it back, and `restart: unless-stopped` in the compose file avoids it.
