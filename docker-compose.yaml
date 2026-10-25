@@ -5,11 +5,48 @@ services:
       POSTGRES_USER: shortener
       POSTGRES_PASSWORD: shortener
       POSTGRES_DB: shortener
-    ports: 
-      - "5433:5432"
+    ports:
+      - "5433:5432" # host:container. Only for TablePlus and tests on your Mac;
+                    # the app talks to db:5432 inside the Compose network.
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    # "Container started" is not "database accepting connections".
+    # This check is what lets the app wait for a REAL ready database.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    # A cache must have a memory cap and an eviction policy: when full,
+    # Redis drops the least-recently-used keys instead of refusing writes.
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://shortener:shortener@db:5432/shortener
+      REDIS_ADDR: redis:6379 # service name + container port, as with the DB
+      BASE_URL: http://localhost:8080
+      ADDR: ":8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 15s
 
 volumes:
   pgdata:
-

@@ -97,18 +97,20 @@ func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, shortenResponse{ShortURL: h.baseURL + "/" + link.Code})
 }
 
-// Redirect handles GET /{code}: look up, count the click, redirect.
+// Redirect handles GET /{code}: resolve, count the click, redirect.
 func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 	// PathValue reads the {code} wildcard from the route pattern (Go 1.22+).
 	code := r.PathValue("code")
 
-	link, err := h.store.Get(r.Context(), code)
+	// Resolve returns only the URL. This is the hot path, and the call a
+	// cache in front of the store can answer without touching Postgres.
+	longURL, err := h.store.Resolve(r.Context(), code)
 	if errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "link not found"})
 		return
 	}
 	if err != nil {
-		log.Printf("get link %q: %v", code, err)
+		log.Printf("resolve %q: %v", code, err)
 		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal error"})
 		return
 	}
@@ -119,9 +121,8 @@ func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 		log.Printf("increment clicks %q: %v", code, err)
 	}
 
-	// 302 (Found) is not cached by browsers, so every click reaches us and
-	// gets counted. A 301 would let browsers skip the server on repeat visits.
-	http.Redirect(w, r, link.LongURL, http.StatusFound)
+	// 302 is not cached by browsers, so every click reaches us and is counted.
+	http.Redirect(w, r, longURL, http.StatusFound)
 }
 
 // Routes returns the router with every endpoint registered. main uses it to

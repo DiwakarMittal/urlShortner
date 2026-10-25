@@ -326,3 +326,14 @@ func TestRedirect_Alias(t *testing.T) {
 		t.Errorf("Location = %q, want %q", got, "https://example.com/target")
 	}
 }
+
+func (f *fakeStore) Resolve(ctx context.Context, code string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	l, ok := f.links[code]
+	if !ok {
+		return "", store.ErrNotFound
+	}
+	return l.LongURL, nil
+}

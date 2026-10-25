@@ -38,4 +38,9 @@ type Store interface {
 
 	// IncrementClicks adds one to the click count for the code.
 	IncrementClicks(ctx context.Context, code string) error
+
+	// Resolve returns only the long URL for a code. It is the redirect hot
+	// path, and the one method a cache can safely serve: Get returns a whole
+	// Link including Clicks, which would be stale the moment it was cached.
+	Resolve(ctx context.Context, code string) (string, error)
 }

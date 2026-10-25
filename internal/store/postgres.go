@@ -130,3 +130,22 @@ func (s *PostgresStore) CreateWithCode(ctx context.Context, longURL, code string
 	}
 	return link, nil
 }
+
+// Resolve fetches just the long URL, so the redirect path reads one
+// column instead of the whole row.
+func (s *PostgresStore) Resolve(ctx context.Context, code string) (string, error) {
+	var longURL string
+
+	err := s.pool.QueryRow(ctx,
+		`SELECT long_url FROM links WHERE code = $1`,
+		code,
+	).Scan(&longURL)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve link: %w", err)
+	}
+	return longURL, nil
+}

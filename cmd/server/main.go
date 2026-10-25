@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"urlshortener/internal/handler"
 	"urlshortener/internal/store"
@@ -26,9 +27,7 @@ func getenv(key, fallback string) string {
 }
 
 // main only reports the final error. All the real work lives in run(),
-// because log.Fatal calls os.Exit, which skips deferred calls. Since run()
-// has already returned by the time log.Fatal executes, its defers
-// (like pool.Close) have run.
+// because log.Fatal calls os.Exit, which skips deferred calls.
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -36,78 +35,80 @@ func main() {
 }
 
 func run() error {
-	// ctx is cancelled when the process receives Ctrl+C (SIGINT) or SIGTERM
-	// (what Docker, Kubernetes, and systemd send to stop an app).
+	// ctx is cancelled on Ctrl+C (SIGINT) or SIGTERM (Docker, Kubernetes).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// Configuration comes from the environment, with local defaults.
 	dbURL := getenv("DATABASE_URL", "postgres://shortener:shortener@localhost:5433/shortener")
-	baseURL := getenv("BASE_URL", "http://localhost:8080") // used to build short links
-	addr := getenv("ADDR", ":8080")                        // where the server listens
+	baseURL := getenv("BASE_URL", "http://localhost:8080")
+	addr := getenv("ADDR", ":8080")
+	redisAddr := getenv("REDIS_ADDR", "") // empty = run without a cache
 
-	// One shared connection pool for the whole app. Errors are returned
-	// (wrapped with context) instead of calling log.Fatal, so defers run.
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
 		return fmt.Errorf("create pool: %w", err)
 	}
-	defer pool.Close() // now runs on every exit path
+	defer pool.Close()
 
-	// New() may not connect immediately; Ping proves the DB is reachable.
 	if err := pool.Ping(ctx); err != nil {
 		return fmt.Errorf("ping database: %w", err)
 	}
 	log.Println("connected to Postgres")
 
-	// Wire the layers: pool -> store -> handler. The handler only sees
-	// the store.Store interface.
+	// Build the store stack. Each layer satisfies store.Store, so the
+	// handlers never know whether a cache is present.
 	var s store.Store = store.NewPostgresStore(pool)
+
+	if redisAddr != "" {
+		rdb := redis.NewClient(&redis.Options{
+			Addr:       redisAddr,
+			MaxRetries: -1, // -1 disables retries: a cache should fail fast
+		})
+		defer rdb.Close()
+
+		// The cache is optional: if Redis is down at startup, warn and
+		// carry on. Requests fall back to Postgres.
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		if err := rdb.Ping(pingCtx).Err(); err != nil {
+			log.Printf("warning: redis unreachable (%v); continuing without a warm cache", err)
+		}
+		cancel()
+
+		s = store.NewCachedStore(s, rdb)
+		log.Printf("redis cache enabled (%s)", redisAddr)
+	} else {
+		log.Println("REDIS_ADDR not set; running without a cache")
+	}
+
 	h := handler.NewHandler(s, baseURL)
 
-	// Explicit Server so we can set timeouts; without them, slow clients
-	// can hold connections open forever.
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           handler.LogRequests(h.Routes()), // routes now live in the handler package
+		Handler:           handler.LogRequests(h.Routes()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// ListenAndServe blocks, so run it in a goroutine and report its result
-	// on a channel. The buffer of 1 means the goroutine can always finish
-	// its send, even if nobody is receiving anymore (e.g. after a signal).
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("listening on %s", addr)
 		errCh <- srv.ListenAndServe()
 	}()
 
-	// Wait for whichever happens first: the server fails on its own
-	// (for example, the port is already in use) or we are told to stop.
 	select {
 	case err := <-errCh:
 		return fmt.Errorf("server error: %w", err)
 	case <-ctx.Done():
-		// Restore default signal behavior so a SECOND Ctrl+C kills the
-		// process immediately if shutdown ever hangs.
-		stop()
+		stop() // a second Ctrl+C now force-kills
 		log.Println("shutting down...")
 	}
 
-	// Give in-flight requests up to 10 seconds to finish. This needs a
-	// fresh context: ctx is already cancelled, and Shutdown would give up
-	// immediately if we passed it in.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Shutdown stops accepting new connections, then waits for active
-	// requests. After it is called, ListenAndServe returns
-	// http.ErrServerClosed into errCh; nobody reads it, and that's fine.
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
-
-	// Optional: confirm the server goroutine ended the expected way.
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("server error: %w", err)
 	}

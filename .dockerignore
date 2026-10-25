@@ -1,0 +1,10 @@
+# Keep the build context small and avoid leaking local files into the image.
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+README.md
+*.log
+server
+docker-compose.yaml

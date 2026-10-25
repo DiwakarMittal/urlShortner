@@ -22,9 +22,8 @@ shortener server must be publicly reachable for others to use the links.
 ## Quick start
 
 ```
-docker compose up -d
-docker compose exec -T db psql -U shortener -d shortener < migrations/001_create_links.sql
-go run ./cmd/server
+docker compose up -d --build
+docker compose exec -T db psql -U shortener -d shortener < migrations/001_create_links.sql   # first time only
 ```
 
 Try it:
@@ -359,3 +358,30 @@ docker-compose.yaml                local Postgres
 - `t.Fatalf` only from the test's own goroutine; use `t.Errorf` in
   goroutines. Compare `time.Time` with `Equal`, not `==`.
 - Result: all 9 integration tests pass against the real database.
+
+### Step 15: Containerize the app (`Dockerfile`, `docker-compose.yaml`)
+- Multi-stage build: compile with the Go toolchain image, copy only the
+  static binary (`CGO_ENABLED=0`) into `distroless/static:nonroot`. The
+  final image is about 20 MB instead of about 1 GB, has no shell, and runs
+  as a non-root user.
+- The build image tag must satisfy the `go` line in `go.mod`
+  (`golang:1.26` for `go 1.26.5`), or the build fails.
+- Copy `go.mod`/`go.sum` and run `go mod download` before copying the
+  source, so Docker caches dependencies and code edits rebuild fast.
+- `ENTRYPOINT` in exec form makes the binary PID 1 so it receives SIGTERM
+  directly; shell form would swallow the signal and break graceful
+  shutdown. `stop_grace_period` is longer than the app's 10s shutdown
+  deadline.
+- Inside the Compose network services talk by name on the container port
+  (`db:5432`); `localhost:5433` is only for the host (TablePlus, tests).
+  `localhost` inside a container is the container itself.
+- `depends_on` with `condition: service_healthy` and a `pg_isready`
+  healthcheck makes the app wait for a ready database, not just a started
+  container.
+- Config came from env vars (`DATABASE_URL`, `BASE_URL`, `ADDR`), so no app
+  code changed.
+- Redis runs on the Compose network only (no published port); it is used
+  from Step 16.
+- Gotcha: a leftover `go run` server held port 8080, so the container
+  failed with "address already in use". `lsof -i :8080` finds it. Use
+  either `go run` or the container, not both.

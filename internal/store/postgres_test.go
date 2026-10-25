@@ -256,3 +256,26 @@ func TestCreate_AfterAlias(t *testing.T) {
 		t.Errorf("Create returned ID=%d Code=%q, want ID=2 Code=%q", link.ID, link.Code, "2")
 	}
 }
+
+// Resolve must return just the URL, and map a missing code to ErrNotFound.
+func TestResolve(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	link, err := s.Create(ctx, "https://example.com/page")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := s.Resolve(ctx, link.Code)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got != "https://example.com/page" {
+		t.Errorf("Resolve = %q, want %q", got, "https://example.com/page")
+	}
+
+	if _, err := s.Resolve(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Resolve(missing) error = %v, want ErrNotFound", err)
+	}
+}
