@@ -40,6 +40,7 @@ services:
       REDIS_ADDR: redis:6379 # service name + container port, as with the DB
       BASE_URL: http://localhost:8080
       ADDR: ":8080"
+      CLICK_FLUSH_INTERVAL: 1s
     depends_on:
       db:
         condition: service_healthy

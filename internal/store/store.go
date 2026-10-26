@@ -43,4 +43,10 @@ type Store interface {
 	// path, and the one method a cache can safely serve: Get returns a whole
 	// Link including Clicks, which would be stale the moment it was cached.
 	Resolve(ctx context.Context, code string) (string, error)
+
+	// AddClicks adds many click counts in one round trip: counts maps a
+	// code to how many clicks to add. Unknown codes are ignored. It adds
+	// to the stored value instead of replacing it, so several app
+	// instances can flush into the same row without overwriting each other.
+	AddClicks(ctx context.Context, counts map[string]int64) error
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"urlshortener/internal/shortcode"
@@ -72,10 +73,40 @@ func (f *fakeStore) IncrementClicks(ctx context.Context, code string) error {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// newTestHandler gives each test a fresh fake, so tests never share state.
-func newTestHandler() (*Handler, *fakeStore) {
+// fakeRecorder is a ClickRecorder that just remembers what it was told.
+type fakeRecorder struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func newFakeRecorder() *fakeRecorder {
+	return &fakeRecorder{counts: map[string]int{}}
+}
+
+func (r *fakeRecorder) Record(code string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counts[code]++
+}
+
+func (r *fakeRecorder) count(code string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counts[code]
+}
+
+// newTestHandlerWithClicks gives each test a fresh fake store and recorder,
+// so tests never share state.
+func newTestHandlerWithClicks() (*Handler, *fakeStore, *fakeRecorder) {
 	f := newFakeStore()
-	return NewHandler(f, "http://short.test"), f
+	r := newFakeRecorder()
+	return NewHandler(f, r, "http://short.test"), f, r
+}
+
+// newTestHandler is for tests that don't care about click counting.
+func newTestHandler() (*Handler, *fakeStore) {
+	h, f, _ := newTestHandlerWithClicks()
+	return h, f
 }
 
 // do sends one request through the real router and returns the recorded
@@ -163,7 +194,7 @@ func TestShorten_BadInput(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRedirect_OK(t *testing.T) {
-	h, f := newTestHandler()
+	h, f, clicks := newTestHandlerWithClicks()
 	f.links["abc"] = store.Link{ID: 1, Code: "abc", LongURL: "https://example.com/page"}
 
 	rec := do(h, "GET", "/abc", "")
@@ -174,20 +205,34 @@ func TestRedirect_OK(t *testing.T) {
 	if got := rec.Header().Get("Location"); got != "https://example.com/page" {
 		t.Errorf("Location = %q, want %q", got, "https://example.com/page")
 	}
-	if got := f.links["abc"].Clicks; got != 1 {
-		t.Errorf("Clicks = %d, want 1", got)
+	if got := clicks.count("abc"); got != 1 {
+		t.Errorf("recorded clicks = %d, want 1", got)
 	}
 }
 
 func TestRedirect_CountsEveryVisit(t *testing.T) {
-	h, f := newTestHandler()
+	h, f, clicks := newTestHandlerWithClicks()
 	f.links["abc"] = store.Link{ID: 1, Code: "abc", LongURL: "https://example.com"}
 
 	do(h, "GET", "/abc", "")
 	do(h, "GET", "/abc", "")
 
-	if got := f.links["abc"].Clicks; got != 2 {
-		t.Errorf("Clicks = %d, want 2", got)
+	if got := clicks.count("abc"); got != 2 {
+		t.Errorf("recorded clicks = %d, want 2", got)
+	}
+}
+
+// Only successful lookups are counted: a 404 must never reach the counter.
+func TestRedirect_NotFound_NotCounted(t *testing.T) {
+	h, _, clicks := newTestHandlerWithClicks()
+
+	rec := do(h, "GET", "/nope", "")
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if got := clicks.count("nope"); got != 0 {
+		t.Errorf("recorded clicks = %d, want 0", got)
 	}
 }
 
@@ -336,4 +381,17 @@ func (f *fakeStore) Resolve(ctx context.Context, code string) (string, error) {
 		return "", store.ErrNotFound
 	}
 	return l.LongURL, nil
+}
+
+func (f *fakeStore) AddClicks(ctx context.Context, counts map[string]int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	for code, n := range counts {
+		if l, ok := f.links[code]; ok {
+			l.Clicks += n // map holds copies: read, change, write back
+			f.links[code] = l
+		}
+	}
+	return nil
 }

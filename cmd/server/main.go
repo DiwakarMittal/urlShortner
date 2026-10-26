@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"urlshortener/internal/clicks"
 	"urlshortener/internal/handler"
 	"urlshortener/internal/store"
 )
@@ -44,6 +45,11 @@ func run() error {
 	baseURL := getenv("BASE_URL", "http://localhost:8080")
 	addr := getenv("ADDR", ":8080")
 	redisAddr := getenv("REDIS_ADDR", "") // empty = run without a cache
+
+	flushEvery, err := time.ParseDuration(getenv("CLICK_FLUSH_INTERVAL", "1s"))
+	if err != nil {
+		return fmt.Errorf("parse CLICK_FLUSH_INTERVAL: %w", err)
+	}
 
 	pool, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
@@ -81,7 +87,24 @@ func run() error {
 		log.Println("REDIS_ADDR not set; running without a cache")
 	}
 
-	h := handler.NewHandler(s, baseURL)
+	// Clicks are counted in memory and flushed in batches. The deferred
+	// Close runs on EVERY return path below, and always AFTER srv.Shutdown
+	// has finished (we only return after it), so no request can record a
+	// click after the final flush. Deferred calls run last-in-first-out, so
+	// this runs before pool.Close and rdb.Close, while the DB is still open.
+	counter := clicks.NewCounter(s, flushEvery)
+	defer func() {
+		// The main ctx is already cancelled by now, so use a fresh one.
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := counter.Close(flushCtx); err != nil {
+			log.Printf("flush clicks on shutdown: %v", err)
+			return
+		}
+		log.Println("click counter flushed")
+	}()
+
+	h := handler.NewHandler(s, counter, baseURL)
 
 	srv := &http.Server{
 		Addr:              addr,

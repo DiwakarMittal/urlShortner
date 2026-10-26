@@ -14,13 +14,20 @@ import (
 // interface, never on Postgres, so the database could be swapped or faked.
 type Handler struct {
 	store   store.Store
+	clicks  ClickRecorder
 	baseURL string // public address of this server, e.g. "http://localhost:8080"
+}
+
+// ClickRecorder counts a visit without blocking the redirect. The real
+// implementation (clicks.Counter) aggregates in memory; tests use a fake.
+type ClickRecorder interface {
+	Record(code string)
 }
 
 // NewHandler is the constructor. TrimRight removes a trailing "/" so we
 // never build URLs like "http://host//abc".
-func NewHandler(s store.Store, baseURL string) *Handler {
-	return &Handler{store: s, baseURL: strings.TrimRight(baseURL, "/")}
+func NewHandler(s store.Store, c ClickRecorder, baseURL string) *Handler {
+	return &Handler{store: s, clicks: c, baseURL: strings.TrimRight(baseURL, "/")}
 }
 
 // Request and response bodies. The `json:"..."` tags set the JSON key names.
@@ -97,13 +104,11 @@ func (h *Handler) Shorten(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, shortenResponse{ShortURL: h.baseURL + "/" + link.Code})
 }
 
-// Redirect handles GET /{code}: resolve, count the click, redirect.
+// Redirect handles GET /{code}: resolve, record the click, redirect.
 func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 	// PathValue reads the {code} wildcard from the route pattern (Go 1.22+).
 	code := r.PathValue("code")
 
-	// Resolve returns only the URL. This is the hot path, and the call a
-	// cache in front of the store can answer without touching Postgres.
 	longURL, err := h.store.Resolve(r.Context(), code)
 	if errors.Is(err, store.ErrNotFound) {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "link not found"})
@@ -115,11 +120,9 @@ func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If counting fails, log it but still redirect: the visitor shouldn't
-	// lose their page because our statistics broke.
-	if err := h.store.IncrementClicks(r.Context(), code); err != nil {
-		log.Printf("increment clicks %q: %v", code, err)
-	}
+	// An in-memory increment: no database, no network, no error to handle.
+	// Only successful lookups are counted, so 404s never reach the counter.
+	h.clicks.Record(code)
 
 	// 302 is not cached by browsers, so every click reaches us and is counted.
 	http.Redirect(w, r, longURL, http.StatusFound)

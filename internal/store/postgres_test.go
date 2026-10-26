@@ -279,3 +279,54 @@ func TestResolve(t *testing.T) {
 		t.Errorf("Resolve(missing) error = %v, want ErrNotFound", err)
 	}
 }
+
+// AddClicks must ADD to the stored value (not replace it), ignore unknown
+// codes, and treat an empty batch as a no-op.
+func TestAddClicks(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := s.Create(ctx, "https://a.example")
+	if err != nil {
+		t.Fatalf("Create a: %v", err)
+	}
+	b, err := s.Create(ctx, "https://b.example")
+	if err != nil {
+		t.Fatalf("Create b: %v", err)
+	}
+
+	clicksOf := func(code string) int64 {
+		t.Helper()
+		l, err := s.Get(ctx, code)
+		if err != nil {
+			t.Fatalf("Get %q: %v", code, err)
+		}
+		return l.Clicks
+	}
+
+	// "nope" does not exist and must be ignored, not an error.
+	if err := s.AddClicks(ctx, map[string]int64{a.Code: 5, b.Code: 3, "nope": 2}); err != nil {
+		t.Fatalf("AddClicks: %v", err)
+	}
+	if got := clicksOf(a.Code); got != 5 {
+		t.Errorf("a clicks = %d, want 5", got)
+	}
+	if got := clicksOf(b.Code); got != 3 {
+		t.Errorf("b clicks = %d, want 3", got)
+	}
+
+	// A second batch adds on top: 5 + 2 = 7, and b is untouched.
+	if err := s.AddClicks(ctx, map[string]int64{a.Code: 2}); err != nil {
+		t.Fatalf("AddClicks: %v", err)
+	}
+	if got := clicksOf(a.Code); got != 7 {
+		t.Errorf("a clicks = %d, want 7", got)
+	}
+	if got := clicksOf(b.Code); got != 3 {
+		t.Errorf("b clicks = %d, want 3 (must not change)", got)
+	}
+
+	if err := s.AddClicks(ctx, map[string]int64{}); err != nil {
+		t.Errorf("empty AddClicks: %v", err)
+	}
+}

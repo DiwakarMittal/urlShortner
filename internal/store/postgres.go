@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"urlshortener/internal/shortcode"
 
 	"github.com/jackc/pgx/v5"
@@ -148,4 +149,43 @@ func (s *PostgresStore) Resolve(ctx context.Context, code string) (string, error
 		return "", fmt.Errorf("resolve link: %w", err)
 	}
 	return longURL, nil
+}
+
+// AddClicks applies a whole batch of click counts in ONE statement.
+//
+// unnest($1, $2) zips the two arrays into rows of (code, n), and the
+// UPDATE joins them against links. Codes that don't exist simply match
+// no row. "clicks = clicks + n" adds to the stored value inside Postgres,
+// so concurrent flushes from several instances never overwrite each other.
+func (s *PostgresStore) AddClicks(ctx context.Context, counts map[string]int64) error {
+	if len(counts) == 0 {
+		return nil
+	}
+
+	// Sorting gives every instance the same order, which keeps row locks
+	// in a consistent order (best effort against deadlocks; a failed batch
+	// is merged back by the Counter and retried, so no counts are lost).
+	codes := make([]string, 0, len(counts))
+	for code := range counts {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	ns := make([]int64, len(codes))
+	for i, code := range codes {
+		ns[i] = counts[code]
+	}
+
+	// pgx sends Go slices as Postgres arrays.
+	_, err := s.pool.Exec(ctx,
+		`UPDATE links AS l
+		 SET clicks = l.clicks + d.n
+		 FROM unnest($1::text[], $2::bigint[]) AS d(code, n)
+		 WHERE l.code = d.code`,
+		codes, ns,
+	)
+	if err != nil {
+		return fmt.Errorf("add clicks: %w", err)
+	}
+	return nil
 }
