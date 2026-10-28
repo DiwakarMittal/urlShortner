@@ -13,9 +13,11 @@ import (
 // Handler holds what the HTTP handlers need. It depends on the Store
 // interface, never on Postgres, so the database could be swapped or faked.
 type Handler struct {
-	store   store.Store
-	clicks  ClickRecorder
-	baseURL string // public address of this server, e.g. "http://localhost:8080"
+	store      store.Store
+	clicks     ClickRecorder
+	baseURL    string // public address of this server, e.g. "http://localhost:8080"
+	shortenMW  Middleware
+	redirectMW Middleware
 }
 
 // ClickRecorder counts a visit without blocking the redirect. The real
@@ -25,9 +27,15 @@ type ClickRecorder interface {
 }
 
 // NewHandler is the constructor. TrimRight removes a trailing "/" so we
-// never build URLs like "http://host//abc".
+// never build URLs like "http://host//abc". Both routes start unlimited.
 func NewHandler(s store.Store, c ClickRecorder, baseURL string) *Handler {
-	return &Handler{store: s, clicks: c, baseURL: strings.TrimRight(baseURL, "/")}
+	return &Handler{
+		store:      s,
+		clicks:     c,
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		shortenMW:  noMiddleware,
+		redirectMW: noMiddleware,
+	}
 }
 
 // Request and response bodies. The `json:"..."` tags set the JSON key names.
@@ -44,6 +52,11 @@ type shortenRequest struct {
 	URL   string `json:"url"`
 	Alias string `json:"alias"` // optional; empty means "generate a code for me"
 }
+
+// Middleware wraps a handler, for example with a rate limiter.
+type Middleware func(http.Handler) http.Handler
+
+func noMiddleware(next http.Handler) http.Handler { return next }
 
 // writeJSON sends v as JSON with the given status code.
 // Order matters: headers must be set BEFORE WriteHeader, because changes
@@ -130,11 +143,21 @@ func (h *Handler) Redirect(w http.ResponseWriter, r *http.Request) {
 
 // Routes returns the router with every endpoint registered. main uses it to
 // serve traffic and tests use it to send requests, so both exercise the
-// same routing. (r.PathValue only works for requests that went through
-// the mux, which is why tests must not call h.Redirect directly.)
+// same routing. Each route is wrapped in its own (possibly empty) limiter.
 func (h *Handler) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /shorten", h.Shorten)
-	mux.HandleFunc("GET /{code}", h.Redirect)
+	mux.Handle("POST /shorten", h.shortenMW(http.HandlerFunc(h.Shorten)))
+	mux.Handle("GET /{code}", h.redirectMW(http.HandlerFunc(h.Redirect)))
 	return mux
+}
+
+// UseLimits sets per-route middleware. A nil argument leaves that route
+// unlimited, so creating links and redirecting can have different limits.
+func (h *Handler) UseLimits(shorten, redirect Middleware) {
+	if shorten != nil {
+		h.shortenMW = shorten
+	}
+	if redirect != nil {
+		h.redirectMW = redirect
+	}
 }

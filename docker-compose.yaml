@@ -41,6 +41,10 @@ services:
       BASE_URL: http://localhost:8080
       ADDR: ":8080"
       CLICK_FLUSH_INTERVAL: 1s
+      RATE_SHORTEN_PER_MIN: 10
+      RATE_SHORTEN_BURST: 10
+      RATE_REDIRECT_PER_SEC: 0 # 0 = redirects are not limited
+      TRUSTED_PROXIES: "" # CIDRs of proxies allowed to set X-Forwarded-For
     depends_on:
       db:
         condition: service_healthy

@@ -1,13 +1,17 @@
-# URL Shortener (Go + Postgres)
+# URL Shortener (Go + Postgres + Redis)
 
-A learning project: a service that turns long URLs into short codes and
-redirects visitors to the original page.
+A learning project that grows from a basic shortener into a read-heavy,
+horizontally scalable service: validation, custom aliases, a Redis cache,
+batched click counting, graceful shutdown, tests at four levels, and
+measured benchmarks for every performance change.
 
 ## How it works
 
 1. **Create**: client sends a long URL, server stores it, returns a short code.
-2. **Redirect**: visitor opens `/<code>`, server looks it up and replies
-   with a redirect (`302` + `Location` header) to the long URL.
+2. **Redirect**: visitor opens `/<code>`, server looks it up (Redis first,
+   Postgres on a miss) and replies with a redirect (`302` + `Location`
+   header) to the long URL. The click is counted in memory and flushed to
+   Postgres in batches.
 
 The short link is only a pointer. The original page is unchanged, and the
 shortener server must be publicly reachable for others to use the links.
@@ -20,6 +24,8 @@ shortener server must be publicly reachable for others to use the links.
 | `GET /{code}` | `302` redirect to the long URL (click counted) | `404` unknown code, `500` |
 
 ## Quick start
+
+Everything (app, Postgres, Redis) runs with Docker Compose:
 
 ```
 docker compose up -d --build
@@ -39,7 +45,9 @@ Custom alias (3 to 32 characters, must contain a `-` or `_`):
 curl -i -X POST localhost:8080/shorten -d '{"url":"https://example.com","alias":"my-link"}'
 ```
 
-Run all tests: `go test -count=1 ./...`
+Logs: `docker compose logs -f app`. Stop gracefully: `docker compose stop app`.
+
+Run all tests (with the race detector): `go test -race -count=1 ./...`
 
 Integration tests (real Postgres; see Step 14 for the one-time setup):
 
@@ -47,36 +55,49 @@ Integration tests (real Postgres; see Step 14 for the one-time setup):
 TEST_DATABASE_URL="postgres://shortener:shortener@localhost:5433/shortener_test" go test -count=1 -v ./internal/store/
 ```
 
-| Env var | Default |
-|---|---|
-| `DATABASE_URL` | `postgres://shortener:shortener@localhost:5433/shortener` |
-| `BASE_URL` | `http://localhost:8080` |
-| `ADDR` | `:8080` |
+Port 8080 is used by the container. Don't also run `go run ./cmd/server`
+at the same time (you would get "address already in use").
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | `postgres://shortener:shortener@localhost:5433/shortener` | Postgres connection (Compose sets `db:5432`) |
+| `REDIS_ADDR` | empty | Redis address; empty runs without a cache (Compose sets `redis:6379`) |
+| `BASE_URL` | `http://localhost:8080` | public address used to build short links |
+| `ADDR` | `:8080` | listen address |
+| `CLICK_FLUSH_INTERVAL` | `1s` | how often batched click counts are written to Postgres |
 
 ## Tech choices (and why)
 
 | Choice | Why |
 |---|---|
 | Go `net/http` | Standard library is enough; Go 1.22+ `ServeMux` supports `GET /{code}` patterns, so no router needed |
-| Postgres | Production-grade; `BIGSERIAL` gives unique IDs and `UPDATE ... clicks + 1` is atomic |
+| Postgres | Production-grade; `BIGSERIAL` gives unique IDs and `UPDATE ... clicks + n` is atomic |
 | `pgx` + `pgxpool` | Modern Postgres driver; the pool reuses connections instead of opening one per request |
 | Base62 of the row ID | IDs are unique by construction, so no collision checks or retries |
-| `Store` interface | Handlers depend on an interface, not Postgres: simple handlers, swappable DB, fakes in tests |
+| `Store` interface | Handlers depend on an interface, not Postgres: simple handlers, swappable DB, fakes in tests, and a cache that slots in as a decorator |
+| Redis cache | Redirects are read-heavy; hot links are served without touching Postgres |
+| In-memory click counter | Keeps the click write off the request path (see Benchmarks) |
+| Docker multi-stage build | About 20 MB final image, no shell, non-root; the prerequisite for running several instances |
 
 ## Project structure
 
 ```
-cmd/server/main.go                 entry point: config, DB, graceful shutdown
+cmd/server/main.go                 entry point: config, wiring, graceful shutdown
 internal/store/store.go            Link struct, Store interface, errors
 internal/store/postgres.go         Postgres implementation
 internal/store/postgres_test.go    integration tests (need TEST_DATABASE_URL)
+internal/store/cached.go           Redis cache decorator (cache-aside, negative caching)
+internal/store/cached_test.go      cache tests (miniredis, no Docker needed)
+internal/clicks/counter.go         in-memory click aggregation + batched flush
+internal/clicks/counter_test.go    counter tests (race-detector friendly)
 internal/handler/handler.go        HTTP handlers and routes
 internal/handler/validate.go       URL and alias validation
 internal/handler/middleware.go     access log middleware
-internal/handler/*_test.go         handler, validation, middleware tests
+internal/handler/*_test.go         handler, validation, middleware tests (fake store)
 internal/shortcode/base62.go       base62 encoding (+ test)
 migrations/001_create_links.sql    schema
-docker-compose.yaml                local Postgres
+Dockerfile                         multi-stage build of the app
+docker-compose.yaml                app + Postgres + Redis
 ```
 
 `internal/` is enforced by Go: other modules cannot import these packages.
@@ -86,18 +107,66 @@ docker-compose.yaml                local Postgres
 - Connection: PostgreSQL, host `127.0.0.1`, port **5433** (the host side
   of the Docker port mapping), user/password/database `shortener`.
 - Browse rows under `public` -> `links` (Data tab) and the schema in the
-  Structure tab. Refresh (Cmd+R) to see new clicks; it doesn't live-update.
+  Structure tab. Refresh (Cmd+R) to see new clicks; it doesn't live-update,
+  and click counts lag by up to the flush interval.
 - Manual edits and `UPDATE`/`DELETE` here affect real data; always use a
   `WHERE`.
+
+## Benchmarks
+
+Tool: `hey -n 20000 -c 50 -disable-redirects http://localhost:8080/1`
+(the scheme is required, and `-disable-redirects` stops `hey` from
+following the redirect to the target site). Everything runs on one laptop
+inside Docker's VM, so only the *relative* numbers matter. Short runs vary
+by about 8%; use `hey -z 10s` and the median of three for comparisons.
+
+| Step | Requests/sec | p50 | p99 | Notes |
+|---|---|---|---|---|
+| 15: Postgres only | 4,398 | 10.6 ms | 20.9 ms | SELECT + UPDATE per redirect |
+| 16: Redis cache, `/1` | 4,426 | 10.6 ms | 19.4 ms | hit rate 99.997%, but throughput unchanged |
+| 16: Redis cache, `/nope` (no click) | 34,759 | 1.3 ms | 2.8 ms | 8x faster: the click UPDATE was the ceiling |
+| 17: clicks batched, `/1` | 34,291 | 1.3 ms | 3.4 ms | 7.7x faster than Step 16; within 1% of the no-click ceiling |
+
+Throughput = concurrency / latency (50 / 0.0014 s is about 35,700/s), so
+`hey` numbers can be sanity-checked with Little's law.
+
+Concurrency sweep on `/1` (Step 16, before batching): c=10 gave 4,670/s
+(2.1 ms avg), c=50 gave 4,426/s (11.2 ms), c=200 gave 4,291/s (46.4 ms).
+Throughput stayed flat while latency grew linearly with concurrency, the
+signature of a serialized queue: every request updated the same row, and
+updates to one row run one after another.
+
+Findings:
+- Removing the SELECT (the cache) did nothing for throughput, so the SELECT
+  was never the bottleneck.
+- Moving the click write off the hot path was the real win.
+- With the hot row gone, the new ceiling is some mix of Redis, the Go
+  server, `hey`, and Docker's network layer on one laptop. Step 20
+  (several instances) is meant to tell which.
 
 ## Known limitations
 
 - Generated codes are sequential, so links can be enumerated.
 - Aliases are case-sensitive (`My-Link` and `my-link` differ).
-- No rate limiting, authentication, link expiry, or per-click analytics.
+- No rate limiting, authentication, or link expiry yet. Clicks are counted
+  per link; there are no per-click events (timestamp, referrer) yet.
 - Validation checks URL shape only, not whether the site exists or is safe.
-- Click counting is synchronous (one extra DB write per redirect).
-- Runs locally; not yet deployed or containerized.
+- Click counts are held in memory and flushed every `CLICK_FLUSH_INTERVAL`.
+  A graceful stop loses nothing; a hard crash (SIGKILL, power loss) loses
+  up to one interval of clicks. `Clicks` read via `Get` is eventually
+  consistent. This is fine for popularity counters, not for billing.
+- While Postgres is down, failed click flushes log a line every second.
+- One app instance, one Redis, one Postgres. It runs locally under Docker
+  Compose and is not deployed anywhere yet.
+
+## Roadmap
+
+| Step | Planned |
+|---|---|
+| 18 | Rate limiting: token bucket in a Redis Lua script, shared across instances |
+| 19 | Click analytics events and a distributed ID generator (block allocation or Snowflake-style) |
+| 20 | Several app instances behind nginx; health checks; load tests |
+| 21 | Read replicas and sharding discussion |
 
 ## Step log
 
@@ -105,8 +174,9 @@ docker-compose.yaml                local Postgres
 - `Link` mirrors one row of the `links` table.
 - Store only the **code** (`aB3xYz`), not the full short URL. The domain is
   configuration, not data.
-- `Store` started with three methods: `Create`, `Get`, `IncrementClicks`
-  (a fourth, `CreateWithCode`, arrives in Step 13).
+- `Store` started with three methods: `Create`, `Get`, `IncrementClicks`.
+  Later steps added `CreateWithCode` (Step 13), `Resolve` (Step 16) and
+  `AddClicks` (Step 17).
 - `ErrNotFound` is a sentinel error so handlers can return 404 using
   `errors.Is`.
 - Go convention: `context.Context` is the first parameter of anything that
@@ -146,8 +216,8 @@ docker-compose.yaml                local Postgres
   billion IDs.
 - Caveats: codes are case-sensitive, and sequential IDs are guessable.
 - Tested with a table-driven test (a slice of `{input, want}` structs
-  looped over). Hand-verified cases: 0→"0", 1→"1", 61→"Z", 62→"10",
-  125→"21".
+  looped over). Hand-verified cases: 0 -> "0", 1 -> "1", 61 -> "Z",
+  62 -> "10", 125 -> "21".
 - Go caches passing tests; use `go test -count=1` to force a rerun.
 - Lesson: `string(int)` gives a Unicode character, not digits. Index into
   an alphabet instead.
@@ -214,14 +284,15 @@ docker-compose.yaml                local Postgres
   store the cleaned URL, respond 201. Errors from our own failures are
   logged and answered with a generic 500 so internals don't leak.
 - `Redirect`: lookup (404 on `ErrNotFound`), count the click, 302 redirect.
+  (Since Step 16 the lookup is `Resolve`, and since Step 17 the click is
+  recorded in memory instead of written to Postgres on the request path.)
   - **302 vs 301**: browsers cache 301, so repeat visits would skip our
     server and never be counted. 302 always comes back.
-  - A failed click count is logged but doesn't block the redirect.
 - `writeJSON`: set headers before `WriteHeader`; later header changes are
   ignored.
 - `main.go` only wires layers (pool -> store -> handler) and reads config
-  from env (`DATABASE_URL`, `BASE_URL`, `ADDR`). It uses an explicit
-  `http.Server` with `ReadHeaderTimeout` to resist slow-client attacks.
+  from env. It uses an explicit `http.Server` with `ReadHeaderTimeout` to
+  resist slow-client attacks.
 - `log.Fatal` skips deferred calls (fixed in Step 11).
 - Verified with curl: valid shorten -> 201 + short URL; redirect -> 302 with
   `Location`; `javascript:` URL -> 400; invalid JSON -> 400; unknown code ->
@@ -248,9 +319,9 @@ docker-compose.yaml                local Postgres
   `h.Redirect` directly would leave `PathValue` empty.
 - Each test builds a fresh fake so tests never share state.
 - Cases: shorten OK, stores the trimmed URL, bad input (400, nothing
-  stored), redirect OK (302 + `Location` + click counted), every visit
-  counted, unknown code (404), store failure (500 that doesn't leak the
-  internal error).
+  stored), redirect OK (302 + `Location` + click recorded), every visit
+  counted, unknown code (404, not counted), store failure (500 that
+  doesn't leak the internal error).
 - `t.Fatalf` stops a test when later checks are meaningless; `t.Errorf`
   records and continues.
 - Verified the tests can fail by breaking the handler on purpose.
@@ -308,7 +379,7 @@ docker-compose.yaml                local Postgres
   `t.Cleanup` restores it. A cleaner design injects a logger.
 - Verified live: one log line per request (201 / 302 / 404 / 400),
   matching the status `curl -i` shows. The log appears in the server's
-  terminal, not the client's. `go test -count=1 ./...` passes.
+  terminal, not the client's.
 
 ### Step 13: Custom aliases
 - Optional `alias` in `POST /shorten`; invalid -> 400, taken -> 409.
@@ -349,15 +420,15 @@ docker-compose.yaml                local Postgres
   docker compose exec db psql -U shortener -d shortener -c "CREATE DATABASE shortener_test"
   docker compose exec -T db psql -U shortener -d shortener_test < migrations/001_create_links.sql
   ```
-- Each test starts with `TRUNCATE links RESTART IDENTITY` so IDs begin at
-  1. The helper refuses to run unless `current_database()` ends in
-  `_test`, so a wrong URL can't wipe real data.
+- Each test starts with `TRUNCATE links RESTART IDENTITY`, so the first
+  row of every test gets ID 1. The helper refuses to run unless
+  `current_database()` ends in `_test`, so a wrong URL can't wipe real data.
 - No `t.Parallel()`: tests share one table.
 - Concurrency test: 50 goroutines x 10 increments must give exactly 500
   (passed). `clicks = clicks + 1` in SQL is atomic.
 - `t.Fatalf` only from the test's own goroutine; use `t.Errorf` in
   goroutines. Compare `time.Time` with `Equal`, not `==`.
-- Result: all 9 integration tests pass against the real database.
+- Result: all integration tests pass against the real database.
 
 ### Step 15: Containerize the app (`Dockerfile`, `docker-compose.yaml`)
 - Multi-stage build: compile with the Go toolchain image, copy only the
@@ -374,14 +445,91 @@ docker-compose.yaml                local Postgres
   deadline.
 - Inside the Compose network services talk by name on the container port
   (`db:5432`); `localhost:5433` is only for the host (TablePlus, tests).
-  `localhost` inside a container is the container itself.
+  `localhost` inside a container is the container itself, and a published
+  port only exists on the host.
 - `depends_on` with `condition: service_healthy` and a `pg_isready`
   healthcheck makes the app wait for a ready database, not just a started
   container.
-- Config came from env vars (`DATABASE_URL`, `BASE_URL`, `ADDR`), so no app
-  code changed.
-- Redis runs on the Compose network only (no published port); it is used
-  from Step 16.
+- Config came from env vars, so no app code changed.
+- Redis runs on the Compose network only (no published port).
+- Verified: image is 19.6 MB on disk; a new link got code 9 (the volume
+  persisted rows 1-8 across the rebuild); `docker compose stop app` took
+  0.1s and logged "shutting down..." / "server stopped cleanly".
+- Wrong-port experiment: `db:5433` fails with connection refused even
+  though DNS resolves `db` (5433 is the host-side mapping; use 5432 inside
+  the network). With `restart: unless-stopped`, the failing DB ping made the
+  app exit and Docker restart it with growing delays (a crash loop with
+  backoff). Better: retry the connection inside the app before exiting.
 - Gotcha: a leftover `go run` server held port 8080, so the container
-  failed with "address already in use". `lsof -i :8080` finds it. Use
-  either `go run` or the container, not both.
+  failed with "address already in use". `lsof -i :8080` finds it.
+
+### Step 16: Redis cache (`internal/store/cached.go`)
+- `CachedStore` is a decorator around any `Store`: handlers don't change.
+  Embedding the `Store` interface passes `Get`/`IncrementClicks`/`AddClicks`
+  through; only `Resolve`, `Create` and `CreateWithCode` are overridden.
+- New narrow method `Resolve(code) -> url`: the redirect hot path. A cached
+  `Link` would carry a stale `Clicks`, so only the URL is cached.
+- Cache-aside on `Resolve`; write-through on `Create`/`CreateWithCode`.
+- TTL 1h with +/-10% jitter so keys written together don't expire together.
+- Negative caching (30s): scanners probing random codes don't reach
+  Postgres. Written with `SetNX` so it can never overwrite a real link, and
+  `CreateWithCode` overwrites any stale marker (otherwise a new alias would
+  404 until the marker expired).
+- Redis failure = cache miss, never an error; 100ms timeout per Redis call
+  and `MaxRetries: -1` so a hung cache can't slow redirects.
+- `singleflight` collapses concurrent misses on a hot key into one DB
+  query (cache stampede); the shared call uses `context.WithoutCancel` so
+  one cancelled request can't fail everyone waiting, and double-checks the
+  cache before querying.
+- Redis runs with `--maxmemory 64mb --maxmemory-policy allkeys-lru`.
+- `REDIS_ADDR` empty = no cache. Redis down at startup = warning only.
+- Tests use miniredis (fake Redis, TTL fast-forward) and a counting inner
+  store: hit, TTL, negative caching and expiry, stale-404 bug, write-through,
+  Redis-down fallback, stampede (50 goroutines -> 1 query). `TestResolve`
+  checks the real SQL against Postgres.
+- Hit rate during benchmarking: 60,004 hits / 2 misses (the 2 misses are
+  one cold key: singleflight double-checks the cache, so a cold key counts
+  twice).
+- Caching removed the SELECT but throughput did not change (see
+  Benchmarks): each click still did a synchronous UPDATE on one row.
+- Side effects: cached links keep redirecting while Postgres is down, and
+  redirects keep working (from Postgres) while Redis is down.
+
+### Step 17: Click counting off the hot path (`internal/clicks/counter.go`)
+- Finding from the Step 16 benchmarks: every redirect did `UPDATE ...
+  clicks + 1` on the same row, and updates to one row serialize. A request
+  that skipped the UPDATE (`/nope`) ran 8x faster.
+- `Counter` aggregates in memory: `Record(code)` is a locked map increment
+  (nanoseconds, no I/O). Memory is bounded by distinct codes per interval,
+  not by clicks, so there is no "queue full" case to handle.
+- A background loop flushes every second (`CLICK_FLUSH_INTERVAL`) with ONE
+  statement for all codes: `UPDATE links SET clicks = clicks + d.n FROM
+  unnest($1::text[], $2::bigint[]) AS d(code, n) WHERE links.code =
+  d.code`. 20,000 clicks on a hot link become one row update per second.
+- `Flush` swaps the map under the lock and writes OUTSIDE it, so a slow
+  database never blocks `Record`. On failure the counts are merged back
+  and retried on the next tick (nothing lost, memory still bounded).
+- Shutdown order: `srv.Shutdown` first (no more requests), then
+  `counter.Close` (final flush). Implemented with `defer` ordering in
+  `run()`; `Close` is idempotent (`sync.Once`).
+- `clicks = clicks + n` is commutative, so several instances can flush
+  into the same row without overwriting each other. Concurrent flushes of
+  overlapping codes can deadlock occasionally; the retry covers it.
+- The handler depends on a tiny `ClickRecorder` interface, so tests use a
+  fake; 404s are never counted.
+- Tests: aggregation into one batch, empty flush doesn't call the sink,
+  `Record` never blocks during a stuck flush, failure merge-back, `Close`
+  flushes, background timer, concurrent `Record` under `-race`, and a real
+  Postgres test for `AddClicks` (adds, ignores unknown codes, empty no-op).
+- Verified: the counter went 160,010 -> 180,010 across a 20,000-request
+  run (exactly +20,000, nothing lost or double-counted).
+- Graceful stop (`docker compose stop app`): 198,891 -> 218,891, exactly
+  +20,000, and the log shows "server stopped cleanly" BEFORE "click counter
+  flushed", confirming the shutdown ordering.
+- Hard crash (`docker compose kill app` right after a 0.64s burst): 1,119
+  of 20,000 clicks lost (5.6%): whatever arrived after the last 1-second
+  flush tick was only in memory. The loss is bounded by one flush interval
+  of traffic, not a percentage; a shorter interval shrinks it at the cost of
+  more (still batched) UPDATEs.
+- Trade-offs: a graceful stop loses nothing; a hard crash loses up to one
+  interval. Fine for popularity counters, not for billing.

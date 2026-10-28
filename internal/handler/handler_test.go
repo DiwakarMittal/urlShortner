@@ -395,3 +395,40 @@ func (f *fakeStore) AddClicks(ctx context.Context, counts map[string]int64) erro
 	}
 	return nil
 }
+
+// Limits are per route: limiting POST /shorten must not touch redirects.
+func TestUseLimits_AppliesPerRoute(t *testing.T) {
+	h, f := newTestHandler()
+	f.links["abc"] = store.Link{ID: 1, Code: "abc", LongURL: "https://example.com"}
+
+	deny := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+		})
+	}
+	h.UseLimits(deny, nil)
+
+	rec := do(h, "POST", "/shorten", `{"url":"https://example.com/new"}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("POST /shorten status = %d, want 429", rec.Code)
+	}
+	if len(f.links) != 1 {
+		t.Errorf("store has %d links, want 1 (a limited request must not reach the store)", len(f.links))
+	}
+
+	rec = do(h, "GET", "/abc", "")
+	if rec.Code != http.StatusFound {
+		t.Errorf("GET /abc status = %d, want 302 (redirects were not limited)", rec.Code)
+	}
+}
+
+// With no limits configured, every route behaves as before.
+func TestRoutes_UnlimitedByDefault(t *testing.T) {
+	h, _ := newTestHandler()
+
+	rec := do(h, "POST", "/shorten", `{"url":"https://example.com"}`)
+
+	if rec.Code != http.StatusCreated {
+		t.Errorf("status = %d, want 201", rec.Code)
+	}
+}
