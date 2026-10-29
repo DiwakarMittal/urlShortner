@@ -37,8 +37,9 @@ type Handler struct {
 	shortenMW   Middleware
 	redirectMW  Middleware
 	stats       StatsRecorder
-	statsReader StatsReader // nil = no /stats route
-	statsToken  string      // non-empty = /stats needs "Authorization: Bearer <token>"
+	statsReader StatsReader                 // nil = no /stats route
+	statsToken  string                      // non-empty = /stats needs "Authorization: Bearer <token>"
+	ready       func(context.Context) error // dependency check behind /readyz; nil = always ready
 }
 
 // ClickRecorder counts a visit without blocking the redirect. The real
@@ -186,6 +187,8 @@ func (h *Handler) Routes() *http.ServeMux {
 	if h.statsReader != nil {
 		mux.HandleFunc("GET /stats/{code}", h.Stats)
 	}
+	mux.HandleFunc("GET /healthz", h.Healthz)
+	mux.HandleFunc("GET /readyz", h.Readyz)
 	return mux
 }
 
@@ -235,4 +238,30 @@ func (h *Handler) Stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// UseReadiness sets the dependency check behind GET /readyz.
+func (h *Handler) UseReadiness(check func(context.Context) error) { h.ready = check }
+
+// Healthz is LIVENESS: "the process is up". It must not depend on the
+// database, or a database outage would make every replica look dead and
+// get killed in a restart loop.
+func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// Readyz is READINESS: "I can do useful work right now" (Postgres answers).
+// A load balancer or orchestrator can use it to stop sending traffic to a
+// replica without restarting it.
+func (h *Handler) Readyz(w http.ResponseWriter, r *http.Request) {
+	if h.ready != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if err := h.ready(ctx); err != nil {
+			log.Printf("not ready: %v", err)
+			writeJSON(w, http.StatusServiceUnavailable, errorResponse{Error: "not ready"})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

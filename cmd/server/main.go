@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -85,6 +86,11 @@ func buildLimit(rdb *redis.Client, name string, ratePerSec float64, burst int, k
 // main only reports the final error. All the real work lives in run(),
 // because log.Fatal calls os.Exit, which skips deferred calls.
 func main() {
+	// "/server -healthcheck" is how Docker checks the container: the image
+	// has no shell or curl, so the binary asks its own /healthz.
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
@@ -192,6 +198,8 @@ func run() error {
 
 	h := handler.NewHandler(s, counter, baseURL)
 
+	h.UseReadiness(pool.Ping) // /readyz reports whether Postgres answers
+
 	h.UseStats(statsCounter, pg, getenv("STATS_TOKEN", ""))
 
 	// Rate limits: who is "the client" is decided by ClientIP, which only
@@ -211,7 +219,7 @@ func run() error {
 	srv := &http.Server{
 		Addr: addr,
 		// LogRequests is outermost, so 429 responses are logged too.
-		Handler:           handler.LogRequests(h.Routes()),
+		Handler:           withInstance(handler.LogRequests(h.Routes())),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -241,4 +249,32 @@ func run() error {
 
 	log.Println("server stopped cleanly")
 	return nil
+}
+
+// healthcheck returns the process exit code: 0 healthy, 1 not.
+func healthcheck() int {
+	_, port, err := net.SplitHostPort(getenv("ADDR", ":8080"))
+	if err != nil {
+		return 1
+	}
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/healthz")
+	if err != nil {
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
+}
+
+// withInstance labels every response with the container that served it, so
+// load balancing is visible: curl -i shows X-Served-By.
+func withInstance(next http.Handler) http.Handler {
+	host, _ := os.Hostname()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Served-By", host)
+		next.ServeHTTP(w, r)
+	})
 }

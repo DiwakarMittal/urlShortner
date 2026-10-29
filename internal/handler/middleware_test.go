@@ -85,3 +85,21 @@ func TestLogRequests_OmitsQueryString(t *testing.T) {
 		t.Errorf("log leaked the query string: %q", buf.String())
 	}
 }
+
+// Health checks arrive every few seconds; they must not fill the log.
+func TestLogRequests_SkipsHealthChecks(t *testing.T) {
+	buf := captureLog(t)
+	h := LogRequests(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", path, nil))
+	}
+	if buf.Len() != 0 {
+		t.Errorf("health checks were logged: %q", buf.String())
+	}
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/abc", nil))
+	if !strings.Contains(buf.String(), "GET /abc") {
+		t.Errorf("normal request not logged: %q", buf.String())
+	}
+}

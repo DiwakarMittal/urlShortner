@@ -6,13 +6,10 @@ services:
       POSTGRES_PASSWORD: shortener
       POSTGRES_DB: shortener
     ports:
-      - "5433:5432" # host:container. Only for TablePlus and tests on your Mac;
-                    # the app talks to db:5432 inside the Compose network.
+      - "5433:5432" # host:container. Only for TablePlus and tests on your Mac.
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: unless-stopped
-    # "Container started" is not "database accepting connections".
-    # This check is what lets the app wait for a REAL ready database.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"]
       interval: 3s
@@ -21,8 +18,7 @@ services:
 
   redis:
     image: redis:7
-    # A cache must have a memory cap and an eviction policy: when full,
-    # Redis drops the least-recently-used keys instead of refusing writes.
+    # A cache needs a memory cap and an eviction policy.
     command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
     restart: unless-stopped
     healthcheck:
@@ -33,26 +29,47 @@ services:
 
   app:
     build: .
-    ports:
-      - "8080:8080"
+    # No "ports": several replicas can't share one host port. Traffic comes
+    # in through nginx. Run it with: docker compose up -d --scale app=3
     environment:
       DATABASE_URL: postgres://shortener:shortener@db:5432/shortener
-      REDIS_ADDR: redis:6379 # service name + container port, as with the DB
+      REDIS_ADDR: redis:6379
       BASE_URL: http://localhost:8080
       ADDR: ":8080"
       CLICK_FLUSH_INTERVAL: 1s
       RATE_SHORTEN_PER_MIN: 10
       RATE_SHORTEN_BURST: 10
-      RATE_REDIRECT_PER_SEC: 0 # 0 = redirects are not limited
-      TRUSTED_PROXIES: "" # CIDRs of proxies allowed to set X-Forwarded-For
-      STATS_TOKEN: "" # set a value to require "Authorization: Bearer <value>" on /stats
+      RATE_REDIRECT_PER_SEC: 0
+      # nginx's address is somewhere in Docker's private range; trusting the
+      # whole range is fine for local use (it also trusts other containers
+      # on this network, so don't copy it to production as is).
+      TRUSTED_PROXIES: "172.16.0.0/12"
+      STATS_TOKEN: ""
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # The image is distroless (no shell, no curl), so the binary checks itself.
+    healthcheck:
+      test: ["CMD", "/server", "-healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
     restart: unless-stopped
     stop_grace_period: 15s
+
+  nginx:
+    image: nginx:stable-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:

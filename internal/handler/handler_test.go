@@ -587,3 +587,48 @@ func TestStats_RouteAbsentByDefault(t *testing.T) {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
 }
+
+// ---- Step 20: health ----
+
+func TestHealthz(t *testing.T) {
+	h, _, clicks := newTestHandlerWithClicks()
+
+	rec := do(h, "GET", "/healthz", "")
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	// "healthz" must reach the health handler, not be treated as a short code.
+	if got := clicks.count("healthz"); got != 0 {
+		t.Errorf("the health check was counted as a click (%d)", got)
+	}
+}
+
+func TestReadyz(t *testing.T) {
+	tests := []struct {
+		name  string
+		check func(context.Context) error // nil = no check configured
+		want  int
+	}{
+		{"no check configured", nil, http.StatusOK},
+		{"dependency healthy", func(context.Context) error { return nil }, http.StatusOK},
+		{"dependency down", func(context.Context) error { return errors.New("db exploded: password=hunter2") }, http.StatusServiceUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newTestHandler()
+			if tt.check != nil {
+				h.UseReadiness(tt.check)
+			}
+
+			rec := do(h, "GET", "/readyz", "")
+
+			if rec.Code != tt.want {
+				t.Errorf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if strings.Contains(rec.Body.String(), "hunter2") {
+				t.Errorf("response leaked the internal error: %s", rec.Body.String())
+			}
+		})
+	}
+}

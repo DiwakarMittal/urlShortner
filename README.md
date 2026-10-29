@@ -534,7 +534,7 @@ Findings:
 - Trade-offs: a graceful stop loses nothing; a hard crash loses up to one
   interval. Fine for popularity counters, not for billing.
 
-  ### Step 19: Click analytics (`internal/clicks/stats.go`, `internal/store/stats.go`)
+### Step 19: Click analytics (`internal/clicks/stats.go`, `internal/store/stats.go`)
 - Aggregate before you store: clicks are grouped in memory by (code, hour,
   referrer host, device class) and flushed in batches with one
   `INSERT ... ON CONFLICT DO UPDATE SET clicks = clicks + n`. Write volume
@@ -564,3 +564,28 @@ Findings:
   merge-back, close flush, cardinality cap, concurrent record under
   `-race`, handler routes (token, hours validation, no leak on 500), and a
   real-Postgres test for the upsert, unknown codes and the summary queries.
+
+### Step 20: Three instances behind nginx (`nginx/nginx.conf`, `docker-compose.yaml`)
+- nginx on :8080 balances across `app` replicas (`docker compose up -d
+  --scale app=3`); the app publishes no host port. State is shared (Postgres,
+  Redis cache and rate-limit buckets, click counters that flush with
+  `clicks + n`), so any replica can serve any request.
+- Docker DNS answers `app` with every replica's IP; nginx round-robins across
+  them. nginx OSS resolves the name ONCE at start/reload, so after scaling
+  or replacing a replica run `nginx -s reload` (real systems use service
+  discovery).
+- Passive health checking (`max_fails`, `fail_timeout`) plus
+  `proxy_next_upstream` retries another replica when one is down. POST is
+  never retried by default, so a link is not created twice.
+- Upstream `keepalive` reuses connections; without it every request opens a
+  new TCP connection to a replica.
+- Client IP: nginx appends the address it saw to `X-Forwarded-For`; the app
+  trusts the header only from `TRUSTED_PROXIES` (Docker's 172.16.0.0/12) and
+  reads it from the right. The bucket key is the real client, not nginx.
+- `/healthz` (liveness, no dependencies) and `/readyz` (readiness, pings
+  Postgres) are separate on purpose: a database outage must not make every
+  replica look dead and trigger restarts. Health checks aren't logged.
+- The image is distroless (no shell, no curl), so Docker's healthcheck runs
+  `/server -healthcheck`, which requests the app's own `/healthz`.
+- `X-Served-By` (the container name) makes the balancing visible.
+- Verified: (fill in from step20_results.txt)
