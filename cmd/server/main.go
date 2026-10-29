@@ -133,7 +133,8 @@ func run() error {
 
 	// Build the store stack. Each layer satisfies store.Store, so the
 	// handlers never know whether a cache is present.
-	var s store.Store = store.NewPostgresStore(pool)
+	pg := store.NewPostgresStore(pool) // also used directly for stats (not cached)
+	var s store.Store = pg
 
 	// rdb stays nil when Redis isn't configured; the cache and the rate
 	// limiter both use it when present.
@@ -175,7 +176,23 @@ func run() error {
 		log.Println("click counter flushed")
 	}()
 
+	// Per-hour breakdowns by referrer host and device class: same pattern as
+	// the counter. Closed after srv.Shutdown too, and before pool.Close
+	// (deferred calls run last-in-first-out).
+	statsCounter := clicks.NewStatsCounter(pg, flushEvery)
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := statsCounter.Close(flushCtx); err != nil {
+			log.Printf("flush click stats on shutdown: %v", err)
+			return
+		}
+		log.Println("click stats flushed")
+	}()
+
 	h := handler.NewHandler(s, counter, baseURL)
+
+	h.UseStats(statsCounter, pg, getenv("STATS_TOKEN", ""))
 
 	// Rate limits: who is "the client" is decided by ClientIP, which only
 	// believes X-Forwarded-For when the connection comes from a trusted proxy.

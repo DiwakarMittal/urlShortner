@@ -45,6 +45,7 @@ services:
       RATE_SHORTEN_BURST: 10
       RATE_REDIRECT_PER_SEC: 0 # 0 = redirects are not limited
       TRUSTED_PROXIES: "" # CIDRs of proxies allowed to set X-Forwarded-For
+      STATS_TOKEN: "" # set a value to require "Authorization: Bearer <value>" on /stats
     depends_on:
       db:
         condition: service_healthy

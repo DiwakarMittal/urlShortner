@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"urlshortener/internal/shortcode"
 	"urlshortener/internal/store"
@@ -430,5 +431,159 @@ func TestRoutes_UnlimitedByDefault(t *testing.T) {
 
 	if rec.Code != http.StatusCreated {
 		t.Errorf("status = %d, want 201", rec.Code)
+	}
+}
+
+// ---- Step 19: analytics ----
+
+type statCall struct{ code, referer, ua string }
+
+type fakeStatsRecorder struct {
+	mu    sync.Mutex
+	calls []statCall
+}
+
+func (f *fakeStatsRecorder) Record(code string, at time.Time, referer, ua string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, statCall{code, referer, ua})
+}
+
+type fakeStatsReader struct {
+	stats    store.Stats
+	err      error
+	gotCode  string
+	gotSince time.Time
+}
+
+func (f *fakeStatsReader) Stats(ctx context.Context, code string, since time.Time) (store.Stats, error) {
+	f.gotCode, f.gotSince = code, since
+	return f.stats, f.err
+}
+
+// doWith is like do, but lets a test set request headers.
+func doWith(h *Handler, method, path string, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	h.Routes().ServeHTTP(rec, req)
+	return rec
+}
+
+func TestRedirect_RecordsStats(t *testing.T) {
+	h, f := newTestHandler()
+	f.links["abc"] = store.Link{ID: 1, Code: "abc", LongURL: "https://example.com"}
+	rec := &fakeStatsRecorder{}
+	h.UseStats(rec, nil, "")
+
+	out := doWith(h, "GET", "/abc", map[string]string{"Referer": "https://www.google.com/x", "User-Agent": "TestUA/1.0"})
+
+	if out.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", out.Code)
+	}
+	want := statCall{"abc", "https://www.google.com/x", "TestUA/1.0"}
+	if len(rec.calls) != 1 || rec.calls[0] != want {
+		t.Errorf("recorded %v, want exactly [%v]", rec.calls, want)
+	}
+}
+
+func TestRedirect_NotFound_NoStats(t *testing.T) {
+	h, _ := newTestHandler()
+	rec := &fakeStatsRecorder{}
+	h.UseStats(rec, nil, "")
+
+	do(h, "GET", "/nope", "")
+
+	if len(rec.calls) != 0 {
+		t.Errorf("recorded %v for a 404, want nothing", rec.calls)
+	}
+}
+
+func TestStats_OK(t *testing.T) {
+	h, _ := newTestHandler()
+	reader := &fakeStatsReader{stats: store.Stats{
+		Code: "abc", Total: 42,
+		ByHour: []store.HourCount{}, TopReferrers: []store.NameCount{}, Devices: []store.NameCount{},
+	}}
+	h.UseStats(nil, reader, "")
+
+	rec := do(h, "GET", "/stats/abc?hours=48", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	var got store.Stats
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil || got.Total != 42 {
+		t.Fatalf("decoded %+v, %v; want Total 42", got, err)
+	}
+	if reader.gotCode != "abc" {
+		t.Errorf("reader asked about %q, want abc", reader.gotCode)
+	}
+	// since = now - 48h, truncated to the hour: between 48h and just over 49h ago
+	if age := time.Since(reader.gotSince); age < 48*time.Hour || age > 49*time.Hour+time.Minute {
+		t.Errorf("since is %v ago, want about 48h", age)
+	}
+}
+
+func TestStats_Errors(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		err  error
+		want int
+	}{
+		{"unknown code", "/stats/abc", store.ErrNotFound, http.StatusNotFound},
+		{"store failure", "/stats/abc", errors.New("db exploded: password=hunter2"), http.StatusInternalServerError},
+		{"hours zero", "/stats/abc?hours=0", nil, http.StatusBadRequest},
+		{"hours not a number", "/stats/abc?hours=abc", nil, http.StatusBadRequest},
+		{"hours too large", "/stats/abc?hours=721", nil, http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := newTestHandler()
+			h.UseStats(nil, &fakeStatsReader{err: tt.err}, "")
+
+			rec := do(h, "GET", tt.path, "")
+
+			if rec.Code != tt.want {
+				t.Errorf("status = %d, want %d", rec.Code, tt.want)
+			}
+			if strings.Contains(rec.Body.String(), "hunter2") {
+				t.Errorf("response leaked the internal error: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestStats_Token(t *testing.T) {
+	h, _ := newTestHandler()
+	h.UseStats(nil, &fakeStatsReader{}, "s3cret")
+
+	tests := []struct {
+		name   string
+		header map[string]string
+		want   int
+	}{
+		{"no header", nil, http.StatusUnauthorized},
+		{"wrong token", map[string]string{"Authorization": "Bearer nope"}, http.StatusUnauthorized},
+		{"right token", map[string]string{"Authorization": "Bearer s3cret"}, http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if rec := doWith(h, "GET", "/stats/abc", tt.header); rec.Code != tt.want {
+				t.Errorf("status = %d, want %d", rec.Code, tt.want)
+			}
+		})
+	}
+}
+
+// Without a reader there is no /stats route at all.
+func TestStats_RouteAbsentByDefault(t *testing.T) {
+	h, _ := newTestHandler()
+
+	if rec := do(h, "GET", "/stats/abc", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
 	}
 }

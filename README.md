@@ -533,3 +533,34 @@ Findings:
   more (still batched) UPDATEs.
 - Trade-offs: a graceful stop loses nothing; a hard crash loses up to one
   interval. Fine for popularity counters, not for billing.
+
+  ### Step 19: Click analytics (`internal/clicks/stats.go`, `internal/store/stats.go`)
+- Aggregate before you store: clicks are grouped in memory by (code, hour,
+  referrer host, device class) and flushed in batches with one
+  `INSERT ... ON CONFLICT DO UPDATE SET clicks = clicks + n`. Write volume
+  depends on the number of distinct groups, not the number of clicks (one
+  row per click would bring back the Step 16 bottleneck).
+- Privacy: no IP addresses; the Referer is reduced to its host (the full
+  URL can hold private paths and tokens); the User-Agent is reduced to
+  desktop / mobile / bot / other.
+- The Referer is attacker-controlled, so cardinality is capped (10,000
+  groups per flush interval); extra referrers fold into "(other)" instead
+  of growing the map. The table can still grow by up to that cap per flush
+  under sustained abuse: enable the redirect rate limit and add a
+  retention job if exposed publicly.
+- Same machinery as Step 17: `Record` is a locked map increment, `Flush`
+  swaps the map and writes outside the lock, failures merge back, `Close`
+  flushes after `srv.Shutdown`. Several instances can flush the same group
+  because the upsert adds.
+- `GET /stats/{code}?hours=24` (1-720): total, clicks per hour, top
+  referrers, devices. `STATS_TOKEN` makes it require
+  `Authorization: Bearer <token>` (constant-time compare); without it the
+  endpoint is public to anyone who knows a code.
+- `Store` interface unchanged: stats methods live on `PostgresStore` and
+  reach the handler through `UseStats`. Stats bypass the Redis cache.
+- Totals (`links.clicks`) and breakdowns (`click_stats`) are two
+  independent pipelines; they agree after a flush (verified: both 60).
+- Tests: classification tables, aggregation and hour split, failure
+  merge-back, close flush, cardinality cap, concurrent record under
+  `-race`, handler routes (token, hours validation, no leak on 500), and a
+  real-Postgres test for the upsert, unknown codes and the summary queries.

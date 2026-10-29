@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -45,7 +46,7 @@ func newTestStore(t *testing.T) *PostgresStore {
 
 	// RESTART IDENTITY resets the BIGSERIAL counter, so the first row in
 	// each test gets ID 1 (and therefore code "1").
-	if _, err := pool.Exec(ctx, "TRUNCATE links RESTART IDENTITY"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE links, click_stats RESTART IDENTITY"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 
@@ -328,5 +329,81 @@ func TestAddClicks(t *testing.T) {
 
 	if err := s.AddClicks(ctx, map[string]int64{}); err != nil {
 		t.Errorf("empty AddClicks: %v", err)
+	}
+}
+
+// AddStats must ADD to existing groups (upsert), ignore unknown codes, and
+// Stats must summarize per hour, referrer and device.
+func TestAddStatsAndStats(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	a, err := s.Create(ctx, "https://a.example")
+	if err != nil {
+		t.Fatalf("Create a: %v", err)
+	}
+	b, err := s.Create(ctx, "https://b.example")
+	if err != nil {
+		t.Fatalf("Create b: %v", err)
+	}
+
+	h1 := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	h2 := h1.Add(time.Hour)
+
+	err = s.AddStats(ctx, []StatRow{
+		{a.Code, h1, "google.com", "desktop", 5},
+		{a.Code, h1, "", "mobile", 3},
+		{a.Code, h2, "google.com", "desktop", 2},
+		{b.Code, h1, "x.com", "desktop", 7},
+		{"nope", h1, "z.com", "other", 9}, // unknown code: must be ignored
+	})
+	if err != nil {
+		t.Fatalf("AddStats: %v", err)
+	}
+	// Same group again: must be added to (5 + 1 = 6), not replaced.
+	if err := s.AddStats(ctx, []StatRow{{a.Code, h1, "google.com", "desktop", 1}}); err != nil {
+		t.Fatalf("second AddStats: %v", err)
+	}
+	if err := s.AddStats(ctx, nil); err != nil {
+		t.Errorf("empty AddStats: %v", err)
+	}
+
+	var ignored int
+	if err := s.pool.QueryRow(ctx, "SELECT count(*) FROM click_stats WHERE code = 'nope'").Scan(&ignored); err != nil || ignored != 0 {
+		t.Errorf("rows for the unknown code = %d, %v; want 0", ignored, err)
+	}
+
+	st, err := s.Stats(ctx, a.Code, h1)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Total != 11 {
+		t.Errorf("Total = %d, want 11 (6 + 3 + 2)", st.Total)
+	}
+	if len(st.ByHour) != 2 || !st.ByHour[0].Hour.Equal(h1) || st.ByHour[0].Clicks != 9 ||
+		!st.ByHour[1].Hour.Equal(h2) || st.ByHour[1].Clicks != 2 {
+		t.Errorf("ByHour = %+v, want h1:9 then h2:2", st.ByHour)
+	}
+	if len(st.TopReferrers) != 2 || st.TopReferrers[0] != (NameCount{"google.com", 8}) || st.TopReferrers[1] != (NameCount{"(direct)", 3}) {
+		t.Errorf("TopReferrers = %+v, want google.com:8 then (direct):3", st.TopReferrers)
+	}
+	if len(st.Devices) != 2 || st.Devices[0] != (NameCount{"desktop", 8}) || st.Devices[1] != (NameCount{"mobile", 3}) {
+		t.Errorf("Devices = %+v, want desktop:8 then mobile:3", st.Devices)
+	}
+
+	if st, _ := s.Stats(ctx, a.Code, h2); st.Total != 2 {
+		t.Errorf("Total since h2 = %d, want 2", st.Total)
+	}
+	if st, _ := s.Stats(ctx, b.Code, h1); st.Total != 7 {
+		t.Errorf("b Total = %d, want 7 (must not mix with a)", st.Total)
+	}
+
+	empty, err := s.Stats(ctx, a.Code, h2.Add(time.Hour))
+	if err != nil || empty.Total != 0 || empty.ByHour == nil || len(empty.ByHour) != 0 {
+		t.Errorf("empty window = %+v, %v; want Total 0 and a non-nil empty ByHour", empty, err)
+	}
+
+	if _, err := s.Stats(ctx, "nope", h1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Stats(unknown) error = %v, want ErrNotFound", err)
 	}
 }
