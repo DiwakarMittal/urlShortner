@@ -36,6 +36,12 @@ func LogRequests(next http.Handler) http.Handler {
 		// writer and our recorder never learns the status.
 		next.ServeHTTP(rec, r)
 
+		// Docker polls these every few seconds; logging them would bury
+		// real traffic.
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			return
+		}
+
 		// r.URL.Path only: no query string or body, which can hold secrets.
 		log.Printf("%s %s %d %s", r.Method, r.URL.Path, rec.status, time.Since(start))
 	})
