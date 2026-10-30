@@ -589,3 +589,46 @@ Findings:
   `/server -healthcheck`, which requests the app's own `/healthz`.
 - `X-Served-By` (the container name) makes the balancing visible.
 - Verified: (fill in from step20_results.txt)
+
+### Step 21: Distributed IDs and sharding
+- Snowflake-style IDs generated in the app (`internal/idgen`): 41 bits of
+  milliseconds since 2026-01-01, 10 bits of node, 12 bits of sequence (4096
+  IDs per node per millisecond). No database round trip, no coordination per
+  request; IDs sort by creation time. The code is the base62 of the ID,
+  about 10 characters (the price of coordination-free IDs; block allocation
+  from a shared counter would keep codes shorter but needs a round trip per
+  block).
+- Clock safety: a small step back (<= 5 ms) is waited out, a larger one is
+  refused, and the sequence rolling over inside one millisecond waits for the
+  next millisecond.
+- Node numbers are LEASED from Redis (`SET NX` with a 30 s expiry, renewed
+  every 10 s; renew and release compare the owner in a Lua script, so an
+  instance can never touch a lease it lost). If the lease is lost or can't be
+  renewed in time, the instance shuts down cleanly and exits with an error so
+  Docker restarts it with a new number. `NODE_ID` pins a number by hand.
+  Limit: an instance frozen for longer than the TTL could collide with the
+  instance that took over its number.
+- With the ID known before the insert, `Create` is ONE `INSERT` (the
+  Step 6 two-statement transaction is gone for production writes).
+- Sharding (`internal/store/sharded.go`): `DATABASE_URLS` lists the shards.
+  A generated code decodes back to its ID and `mix64(id) % N` picks the shard,
+  so a redirect asks exactly one shard. Aliases always contain `-` or `_`
+  (Step 13), so they are routed by a hash of the alias. IDs below 2^22 are the
+  pre-sharding BIGSERIAL rows and are pinned to shard 0.
+- A write spanning several shards is not atomic. If one shard fails during a
+  batched click or stats flush, `ShardedStore` keeps that shard's part and
+  retries it itself, returning success; returning an error would make the
+  counter re-send the whole batch and double count the shards that applied
+  it. Stats rows are merged by key first, because one `INSERT ... ON CONFLICT
+  DO UPDATE` cannot touch the same row twice. Leftover retries are lost if the
+  process exits while a shard is still down.
+- `/readyz` is ready only when every shard answers.
+- Sharding limits the BLAST RADIUS of an outage (links on healthy shards keep
+  working) but gives no redundancy: links on a failed shard are down.
+- Modulo routing cannot grow: going from N to N+1 shards changes the
+  destination of most IDs, so adding a shard needs a data migration.
+  Consistent hashing or virtual shards avoid this. The ORDER of
+  `DATABASE_URLS` defines the shard numbers: never reorder it.
+- Aliases created before sharding stay on shard 0; if one now hashes to
+  another shard it will 404 until moved.
+- Verified: (fill in from step21_results.txt)

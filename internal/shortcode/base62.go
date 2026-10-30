@@ -1,5 +1,10 @@
 package shortcode
 
+import (
+	"math"
+	"strings"
+)
+
 const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 func Encode(id int64) string {
@@ -28,4 +33,24 @@ func Encode(id int64) string {
 	}
 
 	return string(res)
+}
+
+// Decode is the inverse of Encode. ok is false for an empty string, a
+// character outside the alphabet, or a value that doesn't fit in an int64.
+func Decode(code string) (id int64, ok bool) {
+	if code == "" || len(code) > 11 { // 62^11 is already past MaxInt64
+		return 0, false
+	}
+	var n uint64
+	for i := 0; i < len(code); i++ {
+		d := strings.IndexByte(alphabet, code[i])
+		if d < 0 {
+			return 0, false
+		}
+		if n > (math.MaxInt64-uint64(d))/62 { // n*62+d would overflow
+			return 0, false
+		}
+		n = n*62 + uint64(d)
+	}
+	return int64(n), true
 }

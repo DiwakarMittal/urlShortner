@@ -16,6 +16,22 @@ services:
       timeout: 3s
       retries: 10
 
+  db2:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener
+      POSTGRES_DB: shortener
+    ports:
+      - "5434:5432" # shard 1, for TablePlus
+    volumes:
+      - pgdata2:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
   redis:
     image: redis:7
     # A cache needs a memory cap and an eviction policy.
@@ -32,12 +48,15 @@ services:
     # No "ports": several replicas can't share one host port. Traffic comes
     # in through nginx. Run it with: docker compose up -d --scale app=3
     environment:
-      DATABASE_URL: postgres://shortener:shortener@db:5432/shortener
+      # db = shard 0 (holds your existing rows), db2 = shard 1. The ORDER
+      # defines the shard numbers: never reorder or add shards without a data
+      # migration.
+      DATABASE_URLS: postgres://shortener:shortener@db:5432/shortener,postgres://shortener:shortener@db2:5432/shortener
       REDIS_ADDR: redis:6379
       BASE_URL: http://localhost:8080
       ADDR: ":8080"
       CLICK_FLUSH_INTERVAL: 1s
-      RATE_SHORTEN_PER_MIN: 10
+      RATE_SHORTEN_PER_MIN: ${RATE_SHORTEN_PER_MIN:-10} # the test script turns it off temporarily
       RATE_SHORTEN_BURST: 10
       RATE_REDIRECT_PER_SEC: 0
       # nginx's address is somewhere in Docker's private range; trusting the
@@ -47,6 +66,8 @@ services:
       STATS_TOKEN: ""
     depends_on:
       db:
+        condition: service_healthy
+      db2:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -73,3 +94,4 @@ services:
 
 volumes:
   pgdata:
+  pgdata2:

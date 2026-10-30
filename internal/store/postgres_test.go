@@ -407,3 +407,29 @@ func TestAddStatsAndStats(t *testing.T) {
 		t.Errorf("Stats(unknown) error = %v, want ErrNotFound", err)
 	}
 }
+
+func TestInsertWithID(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	link, err := s.InsertWithID(ctx, 1<<30, "abc", "https://example.com")
+	if err != nil {
+		t.Fatalf("InsertWithID: %v", err)
+	}
+	if link.ID != 1<<30 || link.Code != "abc" || link.CreatedAt.IsZero() {
+		t.Errorf("got %+v", link)
+	}
+
+	got, err := s.Get(ctx, "abc")
+	if err != nil || got.ID != 1<<30 || got.LongURL != "https://example.com" {
+		t.Errorf("Get = %+v, %v", got, err)
+	}
+
+	// The same ID or code twice is rejected by the database.
+	if _, err := s.InsertWithID(ctx, 1<<30, "other", "https://x.example"); err == nil {
+		t.Error("duplicate ID accepted")
+	}
+	if _, err := s.InsertWithID(ctx, 1<<31, "abc", "https://x.example"); err == nil {
+		t.Error("duplicate code accepted")
+	}
+}
