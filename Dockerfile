@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # ---- Stage 1: build ----
 # This stage has the full Go toolchain (about 1 GB). Nothing from it ships.
 # Match the tag to the "go" line in your go.mod (check: head -3 go.mod).
