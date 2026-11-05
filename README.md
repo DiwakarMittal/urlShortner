@@ -2,8 +2,10 @@
 
 A learning project that grows from a basic shortener into a read-heavy,
 horizontally scalable service: validation, custom aliases, a Redis cache,
-batched click counting, graceful shutdown, tests at four levels, and
-measured benchmarks for every performance change.
+batched click counting, rate limiting, hourly click analytics, three
+replicas behind nginx, Snowflake-style IDs with leased node numbers, and
+two Postgres shards. Every performance claim is backed by a benchmark, and
+every failure mode was tested on purpose (see the step log).
 
 ## How it works
 
@@ -16,21 +18,49 @@ measured benchmarks for every performance change.
 The short link is only a pointer. The original page is unchanged, and the
 shortener server must be publicly reachable for others to use the links.
 
+## Architecture
+
+```
+                    clients
+                       |
+                  nginx :8080      round-robin, retries around a dead replica
+              +--------+--------+
+            app-1    app-2    app-3     stateless: Go, in-memory click counters,
+              |  \      |      /  |       Snowflake IDs (node number leased from Redis)
+              |   +-----+-----+   |
+              |         |         +----> Redis: cache, rate-limit buckets, node leases
+              |         |
+     Postgres shard 0   Postgres shard 1     routed by the code: mix(id) % 2
+```
+
 ## API
 
 | Request | Success | Errors |
 |---|---|---|
 | `POST /shorten` with `{"url": "...", "alias": "optional-name"}` | `201` `{"short_url": "..."}` | `400` bad JSON / URL / alias, `409` alias taken, `500` |
 | `GET /{code}` | `302` redirect to the long URL (click counted) | `404` unknown code, `500` |
+| `GET /stats/{code}?hours=24` | `200` JSON: total, clicks per hour, top referrers, devices (needs `Authorization: Bearer` if `STATS_TOKEN` is set) | `400` bad `hours`, `401`, `404` |
+| `GET /healthz` | `200`: the process is up (liveness) | |
+| `GET /readyz` | `200` when every Postgres shard answers (readiness) | `503` a shard is down |
+| any limited route | | `429` with `Retry-After` |
 
 ## Quick start
 
-Everything (app, Postgres, Redis) runs with Docker Compose:
+Everything (nginx, three app replicas, two Postgres shards, Redis) runs with
+Docker Compose:
 
 ```
-docker compose up -d --build
-docker compose exec -T db psql -U shortener -d shortener < migrations/001_create_links.sql   # first time only
+docker compose up -d db db2 redis && sleep 8
+for d in db db2; do   # first time only: schema on BOTH shards
+  docker compose exec -T $d psql -U shortener -d shortener < migrations/001_create_links.sql
+  docker compose exec -T $d psql -U shortener -d shortener < migrations/002_create_click_stats.sql
+done
+docker compose up -d --build --scale app=3
 ```
+
+After scaling or replacing replicas, reload nginx so it re-resolves them:
+`docker compose exec nginx nginx -s reload`. A response header,
+`X-Served-By`, shows which replica answered.
 
 Try it:
 
@@ -55,8 +85,9 @@ Integration tests (real Postgres; see Step 14 for the one-time setup):
 TEST_DATABASE_URL="postgres://shortener:shortener@localhost:5433/shortener_test" go test -count=1 -v ./internal/store/
 ```
 
-Port 8080 is used by the container. Don't also run `go run ./cmd/server`
-at the same time (you would get "address already in use").
+Port 8080 is published by nginx (the app replicas publish no host port).
+Don't also run `go run ./cmd/server` on it at the same time (you would get
+"address already in use").
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -64,7 +95,13 @@ at the same time (you would get "address already in use").
 | `REDIS_ADDR` | empty | Redis address; empty runs without a cache (Compose sets `redis:6379`) |
 | `BASE_URL` | `http://localhost:8080` | public address used to build short links |
 | `ADDR` | `:8080` | listen address |
-| `CLICK_FLUSH_INTERVAL` | `1s` | how often batched click counts are written to Postgres |
+| `CLICK_FLUSH_INTERVAL` | `1s` | how often batched click counts and stats are written to Postgres |
+| `DATABASE_URLS` | empty | comma-separated shard DSNs (overrides `DATABASE_URL`); the ORDER defines the shard numbers, never reorder |
+| `NODE_ID` | empty | pin the ID-generator node number (0-1023); empty leases one from Redis |
+| `RATE_SHORTEN_PER_MIN` / `RATE_SHORTEN_BURST` | `10` / `10` | limit for `POST /shorten` per client (0 = off) |
+| `RATE_REDIRECT_PER_SEC` / `RATE_REDIRECT_BURST` | `0` / `0` | limit for redirects (0 = off, the default) |
+| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is believed (Compose trusts `172.16.0.0/12`) |
+| `STATS_TOKEN` | empty | if set, `/stats` requires `Authorization: Bearer <token>` |
 
 ## Tech choices (and why)
 
@@ -78,26 +115,37 @@ at the same time (you would get "address already in use").
 | Redis cache | Redirects are read-heavy; hot links are served without touching Postgres |
 | In-memory click counter | Keeps the click write off the request path (see Benchmarks) |
 | Docker multi-stage build | About 20 MB final image, no shell, non-root; the prerequisite for running several instances |
+| Token bucket in a Redis Lua script | One limit shared by every instance; the script makes read-refill-write atomic |
+| Hourly rollups for analytics | Aggregate before you store: write volume depends on distinct groups, not on clicks |
+| nginx + `--scale app=3` | Load balancing and failover across stateless replicas |
+| Snowflake IDs, node numbers leased from Redis | Unique IDs without a database round trip, so any instance can create links |
+| Modulo sharding over two Postgres databases | A redirect asks exactly one shard; routing needs only the code |
 
 ## Project structure
 
 ```
-cmd/server/main.go                 entry point: config, wiring, graceful shutdown
+cmd/server/main.go                 entry point: config, wiring, shutdown, -healthcheck
 internal/store/store.go            Link struct, Store interface, errors
-internal/store/postgres.go         Postgres implementation
-internal/store/postgres_test.go    integration tests (need TEST_DATABASE_URL)
+internal/store/postgres.go         one Postgres shard
+internal/store/stats.go            analytics rows and queries (per shard)
+internal/store/sharded.go          routing over several shards (modulo, alias hash)
 internal/store/cached.go           Redis cache decorator (cache-aside, negative caching)
-internal/store/cached_test.go      cache tests (miniredis, no Docker needed)
-internal/clicks/counter.go         in-memory click aggregation + batched flush
-internal/clicks/counter_test.go    counter tests (race-detector friendly)
-internal/handler/handler.go        HTTP handlers and routes
+internal/store/*_test.go           integration tests (TEST_DATABASE_URL), cache and shard tests
+internal/clicks/counter.go         in-memory click totals + batched flush
+internal/clicks/stats.go           in-memory hourly rollups by referrer host and device
+internal/clicks/classify.go        Referer -> host, User-Agent -> device class
+internal/idgen/snowflake.go        Snowflake-style ID generator
+internal/idgen/lease.go            node numbers leased from Redis
+internal/ratelimit/                token bucket (Lua), middleware, client IP / trusted proxies
+internal/handler/handler.go        HTTP handlers, routes, health, stats
 internal/handler/validate.go       URL and alias validation
 internal/handler/middleware.go     access log middleware
 internal/handler/*_test.go         handler, validation, middleware tests (fake store)
-internal/shortcode/base62.go       base62 encoding (+ test)
-migrations/001_create_links.sql    schema
+internal/shortcode/base62.go       base62 encode and decode (+ tests)
+migrations/                        001 links, 002 click_stats
+nginx/nginx.conf                   load balancer config
 Dockerfile                         multi-stage build of the app
-docker-compose.yaml                app + Postgres + Redis
+docker-compose.yaml                nginx, app x3, Postgres x2 (shards), Redis
 ```
 
 `internal/` is enforced by Go: other modules cannot import these packages.
@@ -126,6 +174,11 @@ by about 8%; use `hey -z 10s` and the median of three for comparisons.
 | 16: Redis cache, `/1` | 4,426 | 10.6 ms | 19.4 ms | hit rate 99.997%, but throughput unchanged |
 | 16: Redis cache, `/nope` (no click) | 34,759 | 1.3 ms | 2.8 ms | 8x faster: the click UPDATE was the ceiling |
 | 17: clicks batched, `/1` | 34,291 | 1.3 ms | 3.4 ms | 7.7x faster than Step 16; within 1% of the no-click ceiling |
+| 19: + analytics, `/1` | 36,569 | 1.3 ms | 2.8 ms | stats recording is free within noise |
+| 20: 1 replica via nginx | 31,221 | 1.5 ms | 3.8 ms | extra hop through nginx |
+| 20: 2 replicas | 29,142 | 1.5 ms | 5.0 ms | |
+| 20: 3 replicas | 26,223 | 1.6 ms | 7.0 ms | slower: shared CPU (see below) |
+| 21: creates, 3 instances x 2 shards | 8,522 | | | 600 x 201, zero duplicate IDs (limiter off) |
 
 Throughput = concurrency / latency (50 / 0.0014 s is about 35,700/s), so
 `hey` numbers can be sanity-checked with Little's law.
@@ -142,31 +195,60 @@ Findings:
 - Moving the click write off the hot path was the real win.
 - With the hot row gone, the new ceiling is some mix of Redis, the Go
   server, `hey`, and Docker's network layer on one laptop. Step 20
-  (several instances) is meant to tell which.
+  (several instances) showed it is the machine (below).
+- Analytics (Step 19) cost nothing measurable: 36,569 vs 36,470 req/s.
+
+Scaling (Step 20; `hey -z 10s -c 50` through nginx, CPU sampled with
+`docker stats` mid-run):
+
+| Replicas | Requests/sec | p50 | p99 | nginx CPU | app CPU (all replicas) |
+|---|---|---|---|---|---|
+| 1 | 31,221 | 1.5 ms | 3.8 ms | 166% | 223% |
+| 2 | 29,142 | 1.5 ms | 5.0 ms | 177% | 276% |
+| 3 | 26,223 | 1.6 ms | 7.0 ms | 165% | 292% |
+
+Adding replicas made throughput FALL while total app CPU rose: on one
+laptop the load generator, nginx, the replicas and Redis share the same
+cores, so extra replicas add overhead but no capacity. The 36k/s ceiling
+was the machine, not the app. Capping each replica's CPU would be the way
+to show real scaling; not measured.
 
 ## Known limitations
 
-- Generated codes are sequential, so links can be enumerated.
-- Aliases are case-sensitive (`My-Link` and `my-link` differ).
-- No rate limiting, authentication, or link expiry yet. Clicks are counted
-  per link; there are no per-click events (timestamp, referrer) yet.
+- Generated codes are about 10 characters (Snowflake IDs) and time-ordered,
+  so links created close together have similar codes.
+- Aliases are case-sensitive (`My-Link` and `my-link` differ). Aliases
+  created before sharding stay on shard 0 and 404 if they now hash to
+  another shard until moved.
+- No authentication or link expiry. `/stats` is public unless `STATS_TOKEN`
+  is set.
 - Validation checks URL shape only, not whether the site exists or is safe.
-- Click counts are held in memory and flushed every `CLICK_FLUSH_INTERVAL`.
-  A graceful stop loses nothing; a hard crash (SIGKILL, power loss) loses
-  up to one interval of clicks. `Clicks` read via `Get` is eventually
-  consistent. This is fine for popularity counters, not for billing.
-- While Postgres is down, failed click flushes log a line every second.
-- One app instance, one Redis, one Postgres. It runs locally under Docker
-  Compose and is not deployed anywhere yet.
+- Click counts and stats are held in memory and flushed every
+  `CLICK_FLUSH_INTERVAL`. A graceful stop loses nothing; a hard crash loses
+  up to one interval. `Clicks` read via `Get` is eventually consistent.
+  Fine for popularity counters, not for billing.
+- Stats are hourly aggregates (no per-click history); referrer cardinality
+  is capped, not eliminated.
+- While Redis is down, each limiter and cache call waits up to 100 ms
+  before failing open. While Postgres is down, failed flushes log a line
+  every second.
+- Three replicas sit behind ONE nginx (a single point of failure); nginx
+  resolves the replicas at start/reload, so it needs a reload when they
+  change.
+- Two Postgres shards with modulo routing and no replicas: a shard outage
+  takes its links down, and adding a shard needs a data migration.
+- Runs locally under Docker Compose; not deployed anywhere.
 
-## Roadmap
+## Future work
 
-| Step | Planned |
-|---|---|
-| 18 | Rate limiting: token bucket in a Redis Lua script, shared across instances |
-| 19 | Click analytics events and a distributed ID generator (block allocation or Snowflake-style) |
-| 20 | Several app instances behind nginx; health checks; load tests |
-| 21 | Read replicas and sharding discussion |
+- Circuit breaker for Redis (skip it for a few seconds after repeated
+  failures instead of waiting out the 100 ms timeout on every call).
+- Write failover across shards by re-rolling the ID.
+- Consistent hashing or virtual shards, so adding a shard moves only a
+  fraction of the data.
+- Read replicas for the redirect path.
+- Retention job for `click_stats`; authentication and link expiry.
+- CI (GitHub Actions: `go vet`, `go test -race`, Postgres service).
 
 ## Step log
 
@@ -534,6 +616,55 @@ Findings:
 - Trade-offs: a graceful stop loses nothing; a hard crash loses up to one
   interval. Fine for popularity counters, not for billing.
 
+### Step 18: Rate limiting (`internal/ratelimit/`)
+- Token bucket: a bucket holds up to `burst` tokens and refills at a steady
+  rate; each request costs one. It allows short bursts but caps the
+  sustained rate, unlike a fixed window (which permits 2x the limit across
+  a window boundary).
+- State lives in Redis, so every app instance shares one limit. An
+  in-memory limiter per instance would give each client N times the limit.
+- The check is a Lua script, so read-refill-write is ATOMIC inside Redis.
+  From Go it would race (two requests read the same tokens and both pass),
+  and `INCR` followed by `EXPIRE` could leave a key that never expires.
+  Verified: 100 concurrent requests against a burst of 10 let exactly 10
+  through.
+- Clamps in the script: `min(burst, ...)` stops idle time banking extra
+  tokens; `max(0, now - ts)` and `max(now, ts)` stop a backwards clock from
+  creating negative time or free tokens later.
+- Keys expire after `burst/rate + 1s`, so idle clients don't pile up in
+  Redis.
+- Defaults: `POST /shorten` 10 per minute per client, burst 10. Redirects
+  are NOT limited by default: every limited request costs a Redis round
+  trip on the hot path (not measured). `0` turns a limit off.
+- Rejections: `429`, `Retry-After` (whole seconds, rounded up, never 0)
+  and `X-RateLimit-Limit` / `X-RateLimit-Remaining`.
+- Fail open: if Redis is down or slow (100 ms timeout), requests are
+  allowed and the problem is logged. A limiter outage shouldn't take the
+  service down; the cost is that abuse protection is off meanwhile, and
+  every limiter and cache call waits its full 100 ms timeout.
+- Who is the client? The IP. `X-Forwarded-For` can be forged by anyone, so
+  it is only believed when the TCP peer is in `TRUSTED_PROXIES`, and then
+  it is read from the right (each proxy appends the address it saw), so
+  entries an attacker prepended are never reached. IPv6 clients are keyed
+  by /64, because one user controls a whole /64.
+- Wiring: `Handler.UseLimits(shorten, redirect)` wraps each route in its own
+  middleware. `LogRequests` is outermost, so 429s are logged.
+- The time is read on the app instance and passed into the script, so
+  instances with drifting clocks can disagree slightly; reading Redis
+  `TIME` inside the script would give one clock for everyone.
+- Tests (miniredis + a fake clock, no sleeping): burst then deny with exact
+  `RetryAfter`, refill, never exceeds burst, separate clients, backwards
+  clock, per-minute fractional rate, concurrency, key expiry, Redis down,
+  config validation; middleware allow / deny / fail-open / client key;
+  `ClientIP` table (forged headers, chains, IPv6, malformed).
+- Verified live: 12 creates -> ten 201 then two 429; forged
+  `X-Forwarded-For` headers are ignored; the 429 carries `Retry-After: 6`
+  and `X-RateLimit-Remaining: 0`; the Redis bucket held ~0.03 tokens with a
+  TTL of ~60.7 s (burst/rate + 1 s); with Redis stopped, creates (201) and
+  redirects (302) still worked and the log showed "allowing request".
+- Docker Desktop on a Mac: requests from the host all arrive from one
+  gateway address, so every local test shares a bucket.
+
 ### Step 19: Click analytics (`internal/clicks/stats.go`, `internal/store/stats.go`)
 - Aggregate before you store: clicks are grouped in memory by (code, hour,
   referrer host, device class) and flushed in batches with one
@@ -556,14 +687,23 @@ Findings:
   referrers, devices. `STATS_TOKEN` makes it require
   `Authorization: Bearer <token>` (constant-time compare); without it the
   endpoint is public to anyone who knows a code.
-- `Store` interface unchanged: stats methods live on `PostgresStore` and
-  reach the handler through `UseStats`. Stats bypass the Redis cache.
+- `Store` interface unchanged: stats methods live on the store and reach the
+  handler through `UseStats`. Stats bypass the Redis cache.
 - Totals (`links.clicks`) and breakdowns (`click_stats`) are two
   independent pipelines; they agree after a flush (verified: both 60).
 - Tests: classification tables, aggregation and hour split, failure
   merge-back, close flush, cardinality cap, concurrent record under
   `-race`, handler routes (token, hours validation, no leak on 500), and a
   real-Postgres test for the upsert, unknown codes and the summary queries.
+- Verified live: 60 clicks from three visitor kinds gave exactly the
+  expected stats (referrers 30/20/10, devices 30/20/10, total 60);
+  `hours=0` -> 400, unknown code -> 404. Redirect throughput with both
+  counters: 36,569 req/s (p50 1.3 ms, p99 2.8 ms) vs 36,470 before
+  analytics: the cost is within noise.
+- Lesson: an empty `_test.go` file breaks `go build` of its whole package
+  (Go parses every .go file in the folder), and in Docker the failed build
+  silently left the OLD container running, which is how stale results
+  appeared. After a deploy, check the timestamps in the logs.
 
 ### Step 20: Three instances behind nginx (`nginx/nginx.conf`, `docker-compose.yaml`)
 - nginx on :8080 balances across `app` replicas (`docker compose up -d
@@ -573,7 +713,7 @@ Findings:
 - Docker DNS answers `app` with every replica's IP; nginx round-robins across
   them. nginx OSS resolves the name ONCE at start/reload, so after scaling
   or replacing a replica run `nginx -s reload` (real systems use service
-  discovery).
+  discovery). `zone` shares the balancing state between nginx workers.
 - Passive health checking (`max_fails`, `fail_timeout`) plus
   `proxy_next_upstream` retries another replica when one is down. POST is
   never retried by default, so a link is not created twice.
@@ -588,7 +728,19 @@ Findings:
 - The image is distroless (no shell, no curl), so Docker's healthcheck runs
   `/server -healthcheck`, which requests the app's own `/healthz`.
 - `X-Served-By` (the container name) makes the balancing visible.
-- Verified: (fill in from step20_results.txt)
+- Verified: 3 replicas healthy; shared rate limit (ten 201 then 429s served
+  by different instances; bucket keyed by the real client 192.168.65.1, not
+  nginx); graceful stop of all replicas lost no clicks (diff exactly 2000);
+  killing one replica during a 12 s load test gave 230,805 responses, all
+  302 (nginx retried around it); with `zone`, 300 requests balanced exactly
+  100/100/100 (without it, 15/7/8 of 30 because each worker keeps its own
+  rotation).
+- A click-count diff of 3019 vs 3000 in one check was flush timing (about 19
+  clicks were still in memory at the first reading), not loss.
+- Scaling finding: 1 / 2 / 3 replicas gave 31.2k / 29.1k / 26.2k req/s.
+  Throughput FELL as replicas were added while total app CPU rose: on one
+  laptop the load generator, nginx, the replicas and Redis share the same
+  cores. The ceiling was the machine, not the app.
 
 ### Step 21: Distributed IDs and sharding
 - Snowflake-style IDs generated in the app (`internal/idgen`): 41 bits of
@@ -629,6 +781,23 @@ Findings:
   destination of most IDs, so adding a shard needs a data migration.
   Consistent hashing or virtual shards avoid this. The ORDER of
   `DATABASE_URLS` defines the shard numbers: never reorder it.
-- Aliases created before sharding stay on shard 0; if one now hashes to
-  another shard it will 404 until moved.
-- Verified: (fill in from step21_results.txt)
+- Verified live: 3 replicas leased distinct node numbers (694, 364, 117)
+  from Redis; 300 requests balanced exactly 100/100/100; generated codes
+  are 10 characters; 60 new links split 28/32 across two shards and all
+  redirect; legacy link 1 (pinned to shard 0) still redirects; 6 aliases
+  split 2/4 and a duplicate alias returned 409; clicks were recorded on the
+  shard holding the link (26 each).
+- 600 concurrent creates over 3 instances and 2 shards: 600 x 201, +317 /
+  +283 rows, zero duplicate IDs, 3 distinct node numbers (about 8.5k
+  creates/s with the limiter off).
+- Shard outage (`docker compose stop db2`): links on shard 0 kept
+  redirecting, links on shard 1 returned 500, `/readyz` returned 503, and 5
+  of 20 creates failed (the ones routed to the dead shard); everything
+  recovered when the shard returned.
+- Possible improvement: because the ID is generated before the write, a
+  create routed to a down shard could re-roll a new ID until it lands on a
+  healthy shard (write failover). Not implemented.
+- Ops lesson: a failed Docker build (registry timeout, `DeadlineExceeded`)
+  leaves the OLD containers serving traffic, so a deploy script must fail
+  loudly on build errors and confirm the new code is running (logs, node
+  leases).
